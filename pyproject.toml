@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-trading-system"
+version = "0.0.1"
+description = "Local quantitative trading system (backtest / paper / live)."
+requires-python = ">=3.13,<3.14"
+
+# Runtime deps are pinned in requirements.txt (the single place to manage
+# versions). Listed here too for tooling that reads project metadata.
+dependencies = [
+    "ccxt==4.4.99",
+    "xgboost==2.1.4",
+    "pandas==2.3.3",
+    "numpy==2.2.6",
+    "scikit-learn==1.6.1",
+    "fastapi==0.115.14",
+    "uvicorn==0.34.3",
+    "pydantic==2.11.10",
+    "pydantic-settings==2.8.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["config", "core", "ml", "backtest", "web", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

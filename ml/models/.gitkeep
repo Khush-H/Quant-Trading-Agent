@@ -1,0 +1,2 @@
+# Trained model artifacts land here. The directory is tracked; its contents are
+# git-ignored (see .gitignore) because models are large and regenerated.

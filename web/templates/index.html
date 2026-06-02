@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Quant Trading Dashboard</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; }
+    body { margin: 0; background: #0f1115; color: #e6e6e6; }
+    header { padding: 1rem 1.5rem; border-bottom: 1px solid #222; }
+    h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
+    .mode {
+      display: inline-block; margin-left: .75rem; padding: .15rem .6rem;
+      border-radius: 999px; font-size: .75rem; font-weight: 700;
+      letter-spacing: .04em; text-transform: uppercase;
+    }
+    .mode.paper    { background: #1f3a5f; color: #9ecbff; }
+    .mode.backtest { background: #2d2d2d; color: #c9c9c9; }
+    .mode.live     { background: #5f1f1f; color: #ff9e9e; }
+    main { padding: 1.5rem; }
+    .placeholder { color: #777; font-size: .9rem; }
+    .live-warning {
+      margin: 0 0 1rem; padding: .75rem 1rem; border-radius: 8px;
+      background: #3a1414; color: #ffb3b3; border: 1px solid #5f1f1f;
+      font-size: .85rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>
+      Quant Trading Dashboard
+      <span class="mode {{ mode }}">{{ mode }}</span>
+    </h1>
+  </header>
+  <main>
+    {% if is_live %}
+    <p class="live-warning">
+      ⚠ LIVE mode — real funds are at risk. Orders still route through the risk
+      layer, but verify limits before trading.
+    </p>
+    {% endif %}
+    <p class="placeholder">
+      Scaffold. Positions, orders, and the equity curve are wired up during the
+      build (see README build order).
+    </p>
+  </main>
+</body>
+</html>

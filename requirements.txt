@@ -1,0 +1,16 @@
+# Pinned runtime dependencies — do not loosen without a deliberate review.
+# All versions ship cp313 (Python 3.13) wheels for win_amd64. We intentionally
+# stay on the latest API-stable minor of each library (not the newest major)
+# to keep the code that was written against pandas 2.x / xgboost 2.x working.
+ccxt==4.4.99
+xgboost==2.1.4
+pandas==2.3.3
+numpy==2.2.6
+scikit-learn==1.6.1
+fastapi==0.115.14
+uvicorn==0.34.3
+pydantic==2.11.10
+pydantic-settings==2.8.1
+
+# --- Dev / test ---
+pytest==9.0.3
