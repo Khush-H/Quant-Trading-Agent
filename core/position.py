@@ -14,21 +14,37 @@ from typing import Optional
 
 @dataclass
 class Position:
-    """A net position in a single symbol."""
+    """A spot holding in a single symbol.
+
+    SPOT account: flat or long only. ``quantity`` is the size held and is
+    constrained ``>= 0`` — there is no short side. Flat is ``quantity == 0``.
+    This mirrors the ``positions`` table constraint in :mod:`core.database`.
+    """
 
     symbol: str
-    quantity: float = 0.0  # signed: positive long, negative short
+    quantity: float = 0.0  # >= 0; long size held. Flat = 0. Never negative.
     avg_entry_price: float = 0.0
     realized_pnl: float = 0.0
     opened_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
+    def __post_init__(self) -> None:
+        if self.quantity < 0:
+            raise ValueError(
+                f"Spot positions cannot be short: quantity={self.quantity!r} "
+                "(must be >= 0). This is a spot-only account."
+            )
+
     @property
     def is_open(self) -> bool:
-        return self.quantity != 0.0
+        return self.quantity > 0.0
 
     def unrealized_pnl(self, mark_price: float) -> float:
-        """Mark-to-market PnL at the given price."""
+        """Mark-to-market PnL at the given price (long-only).
+
+        With a long-only holding this is simply the size times the move from
+        the average entry; it is zero when flat.
+        """
         return (mark_price - self.avg_entry_price) * self.quantity
 
 
