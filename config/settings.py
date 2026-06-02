@@ -72,6 +72,28 @@ class Settings(BaseSettings):
     # --- Database -----------------------------------------------------------
     database_url: str = Field(default="sqlite:///data/trading.db")
 
+    # --- Features / Labels --------------------------------------------------
+    # Forward horizon (in bars) for the label's forward log return.
+    label_horizon: int = Field(
+        default=1,
+        gt=0,
+        description="N: label the N-period-forward log return. Default 1 bar.",
+    )
+    # Full ROUND-TRIP cost the forward return must clear to be worth a Long.
+    # 0.002 = 20bps taker, covering BOTH legs (buy + sell), not one.
+    round_trip_cost: float = Field(
+        default=0.002,
+        ge=0,
+        description="Round-trip (entry+exit) fee fraction. 0.002 = 20bps total.",
+    )
+    # Extra one-way slippage allowance, in basis points; counted on both legs
+    # so the effective hurdle is round_trip_cost + 2 * (slippage_bps / 10_000).
+    slippage_bps: float = Field(
+        default=0.0,
+        ge=0,
+        description="Per-leg slippage in basis points; applied to both legs.",
+    )
+
     # --- Risk limits --------------------------------------------------------
     max_position_notional: float = Field(default=1000.0, gt=0)
     max_daily_loss: float = Field(default=200.0, gt=0)
@@ -124,6 +146,16 @@ class Settings(BaseSettings):
     @property
     def is_backtest(self) -> bool:
         return self.mode is Mode.BACKTEST
+
+    @property
+    def label_hurdle(self) -> float:
+        """Forward-return threshold a Long must clear to beat costs.
+
+        The full round-trip fee plus per-leg slippage on BOTH legs:
+        ``round_trip_cost + 2 * slippage_bps / 10_000``. A forward log return
+        above this is labelled Long (1); otherwise Flat (0).
+        """
+        return self.round_trip_cost + 2.0 * self.slippage_bps / 10_000.0
 
     def exchange_credentials(self) -> dict[str, Optional[str]]:
         """ccxt-style credential dict, secrets unwrapped at the call site only."""

@@ -1,10 +1,13 @@
 """Persistence layer (data phase).
 
-Owns the SQLite store and the three tables the data layer needs right now:
+Owns the SQLite store and the tables built so far:
 
 * ``candles``       — historical OHLCV bars, one row per (symbol, timeframe, ts).
 * ``system_state``  — a small key/value table for cursors, flags, run metadata.
 * ``positions``     — current spot holdings, one row per symbol.
+* ``features``      — the causal feature matrix (features phase), one row per
+  (symbol, timeframe, ts) where ``ts`` is the CLOSED candle the features were
+  computed from.
 
 Later phases add orders, fills, the risk gate, model governance, and the
 execution engine. They are intentionally NOT created here.
@@ -33,7 +36,19 @@ from typing import Iterable, Iterator, Optional
 from config import Settings, get_settings
 
 # Bumped whenever the schema in init_schema changes in a breaking way.
-SCHEMA_VERSION = 1
+# v2 adds the features table (features/labels phase).
+SCHEMA_VERSION = 2
+
+# Ordered feature columns written to the features table. The order is part of
+# the feature recipe and is hashed into feature_hash by ml.features.
+FEATURE_COLUMNS = (
+    "log_ret_1h",
+    "log_ret_4h",
+    "gk_vol",
+    "gk_vol_ma24",
+    "z_close_50",
+    "z_vol",
+)
 
 _SQLITE_PREFIX = "sqlite:///"
 
@@ -142,6 +157,38 @@ class Database:
                     opened_at       TEXT,
                     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                 );
+
+                -- Causal feature matrix. One row per (symbol, timeframe, ts).
+                --
+                -- ts is the OPEN time (epoch ms, UTC) of the CLOSED candle the
+                -- features were computed FROM — the same bar convention the
+                -- data layer uses after dropping the incomplete trailing bar.
+                -- It is NOT the bar being predicted. The label for this row
+                -- looks at candles strictly after ts (see ml.labels), so the
+                -- feature window and the label window never overlap.
+                --
+                -- Every column is a wide REAL feature; the set/order is fixed
+                -- by FEATURE_COLUMNS. feature_hash identifies the feature
+                -- RECIPE (ordered names + params + code version), so it is the
+                -- same for every row of one build and lets the model phase
+                -- assert it trains on the exact feature definition it expects.
+                CREATE TABLE IF NOT EXISTS features (
+                    symbol       TEXT    NOT NULL,
+                    timeframe    TEXT    NOT NULL,
+                    ts           INTEGER NOT NULL,
+                    log_ret_1h   REAL    NOT NULL,
+                    log_ret_4h   REAL    NOT NULL,
+                    gk_vol       REAL    NOT NULL,
+                    gk_vol_ma24  REAL    NOT NULL,
+                    z_close_50   REAL    NOT NULL,
+                    z_vol        REAL    NOT NULL,
+                    feature_hash TEXT    NOT NULL,
+                    created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    PRIMARY KEY (symbol, timeframe, ts)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_features_symbol_tf_ts
+                    ON features (symbol, timeframe, ts);
                 """
             )
             conn.execute(
@@ -214,3 +261,59 @@ class Database:
                 (symbol, timeframe),
             ).fetchone()
             return int(row["n"])
+
+    def load_candles(
+        self, symbol: str, timeframe: str
+    ) -> list[sqlite3.Row]:
+        """Return all stored bars for (symbol, timeframe), oldest first.
+
+        Rows carry ts/open/high/low/close/volume. The feature builder wraps
+        these into a DataFrame; kept as plain rows here so the data layer has
+        no pandas dependency.
+        """
+        with self.session() as conn:
+            return conn.execute(
+                "SELECT ts, open, high, low, close, volume FROM candles "
+                "WHERE symbol = ? AND timeframe = ? ORDER BY ts ASC;",
+                (symbol, timeframe),
+            ).fetchall()
+
+    # --- features -----------------------------------------------------------
+    def upsert_features(
+        self,
+        symbol: str,
+        timeframe: str,
+        rows: Iterable[dict],
+        feature_hash: str,
+    ) -> int:
+        """Insert/replace feature rows for (symbol, timeframe).
+
+        Each item in ``rows`` is a dict with key ``ts`` (open time of the
+        CLOSED candle the features were computed from) plus one key per
+        :data:`FEATURE_COLUMNS`. Idempotent on (symbol, timeframe, ts).
+        Returns the number of rows written.
+        """
+        payload = [
+            (
+                symbol,
+                timeframe,
+                int(r["ts"]),
+                *(float(r[c]) for c in FEATURE_COLUMNS),
+                feature_hash,
+            )
+            for r in rows
+        ]
+        if not payload:
+            return 0
+        cols = ", ".join(FEATURE_COLUMNS)
+        set_clause = ", ".join(f"{c}=excluded.{c}" for c in FEATURE_COLUMNS)
+        placeholders = ", ".join(["?"] * (3 + len(FEATURE_COLUMNS) + 1))
+        with self.session() as conn:
+            conn.executemany(
+                f"INSERT INTO features (symbol, timeframe, ts, {cols}, feature_hash) "
+                f"VALUES ({placeholders}) "
+                "ON CONFLICT(symbol, timeframe, ts) DO UPDATE SET "
+                f"{set_clause}, feature_hash=excluded.feature_hash;",
+                payload,
+            )
+        return len(payload)

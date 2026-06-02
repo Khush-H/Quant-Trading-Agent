@@ -37,9 +37,36 @@ def test_init_creates_exactly_the_data_phase_tables(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='table';"
             )
         }
-    assert {"candles", "system_state", "positions"} <= names
+    # Data layer + features phase tables.
+    assert {"candles", "system_state", "positions", "features"} <= names
     # The later-phase tables must NOT exist yet.
     assert not ({"orders", "fills", "runs", "models"} & names)
+
+
+def test_feature_upsert_is_idempotent_and_keyed_by_ts(tmp_path):
+    from core.database import FEATURE_COLUMNS
+
+    db = _db(tmp_path)
+
+    def row(ts, fill):
+        return {"ts": ts, **{c: fill for c in FEATURE_COLUMNS}}
+
+    rows = [row(1_000, 0.1), row(2_000, 0.2)]
+    assert db.upsert_features("BTC/USDT", "1h", rows, feature_hash="abc") == 2
+
+    # Re-upsert the same ts with new values + new hash -> update, not duplicate.
+    rows2 = [row(2_000, 0.9)]
+    db.upsert_features("BTC/USDT", "1h", rows2, feature_hash="def")
+    with db.session() as conn:
+        out = conn.execute(
+            "SELECT z_vol, feature_hash FROM features "
+            "WHERE symbol=? AND timeframe=? AND ts=?;",
+            ("BTC/USDT", "1h", 2_000),
+        ).fetchone()
+        n = conn.execute("SELECT COUNT(*) AS n FROM features;").fetchone()["n"]
+    assert n == 2  # still two rows, not three
+    assert out["z_vol"] == 0.9
+    assert out["feature_hash"] == "def"
 
 
 def test_wal_and_busy_timeout_pragmas(tmp_path):
