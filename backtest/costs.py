@@ -1,27 +1,82 @@
-"""Trading cost model.
+"""Trading cost model — the single source of truth for simulated costs.
 
-Fees, slippage, and (optionally) funding. Backtests without realistic costs are
-the most common way to fool yourself, so this is a first-class module rather
-than a constant buried in the engine. Implemented in the backtest phase.
+Backtests without realistic costs are the most common way to fool yourself, so
+this is a first-class module rather than a constant buried in the engine. The
+eventual paper/live simulator MUST reuse this same :class:`CostModel` so the
+numbers a strategy shows in backtest are the numbers it pays when promoted.
+
+Cost of a fill = taker fee on the traded notional + slippage on the traded
+notional. Fees are charged PER SIDE: a round trip (buy then sell) pays the
+taker fee twice, once on each leg, because each leg is its own fill.
+
+Exchange filters (Binance spot): a fill below ``min_notional`` is rejected (the
+exchange would reject it too), and quantities are floored to ``step_size`` and
+prices are not sub-``tick_size``. Sizing that rounds a trade below minNotional
+means "no trade", never a silently-resized one.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class CostModel:
-    """Per-trade cost assumptions.
+class ExchangeFilters:
+    """Binance-style spot symbol filters used to validate a simulated fill.
 
-    Defaults are placeholders; calibrate to the target exchange's actual fee
-    schedule and observed slippage before trusting any backtest.
+    Defaults are typical BTC/USDT spot values; override per symbol when known.
     """
 
-    taker_fee: float = 0.0010  # 10 bps
-    maker_fee: float = 0.0002  # 2 bps
-    slippage_bps: float = 1.0  # 1 bp of notional, as a simple starting model
+    min_notional: float = 10.0   # MIN_NOTIONAL: smallest allowed order value
+    step_size: float = 1e-5      # LOT_SIZE stepSize: quantity granularity
+    min_qty: float = 1e-5        # LOT_SIZE minQty
+    tick_size: float = 0.01      # PRICE_FILTER tickSize
 
-    def cost(self, notional: float, is_taker: bool = True) -> float:
-        """Estimated cost (fees + slippage) for a trade of given notional."""
-        raise NotImplementedError("Cost math implemented in backtest phase.")
+    def round_qty(self, qty: float) -> float:
+        """Floor a quantity to a whole multiple of ``step_size``.
+
+        Floor (not round) so a simulated fill is never larger than what sizing
+        intended — rounding up could push notional past a cap or buy size you
+        don't have cash for.
+        """
+        if self.step_size <= 0:
+            return qty
+        steps = math.floor(qty / self.step_size + 1e-9)
+        return steps * self.step_size
+
+    def meets_min_notional(self, qty: float, price: float) -> bool:
+        return qty > 0 and (qty * price) >= self.min_notional and qty >= self.min_qty
+
+
+@dataclass(frozen=True)
+class CostModel:
+    """Per-side cost assumptions for a simulated spot fill.
+
+    ``taker_fee`` is charged on EACH leg. ``slippage_bps`` is an additional
+    adverse cost per leg, expressed in basis points of notional.
+    """
+
+    taker_fee: float = 0.0010     # 10 bps per side
+    slippage_bps: float = 1.0     # 1 bp of notional per side
+    filters: ExchangeFilters = ExchangeFilters()
+
+    def fill_cost(self, notional: float) -> float:
+        """Total cost (fee + slippage) charged on a single fill of ``notional``.
+
+        One leg only. A round trip calls this twice (once per leg).
+        """
+        if notional <= 0:
+            return 0.0
+        return notional * (self.taker_fee + self.slippage_bps / 10_000.0)
+
+    def can_trade(self, qty: float, price: float) -> bool:
+        """True iff a fill of ``qty`` at ``price`` clears the exchange filters.
+
+        A trade that fails this MUST be skipped by the engine, not resized — the
+        exchange would reject it outright.
+        """
+        return self.filters.meets_min_notional(qty, price)
+
+    def round_qty(self, qty: float) -> float:
+        return self.filters.round_qty(qty)
