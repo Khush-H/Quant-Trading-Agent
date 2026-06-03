@@ -48,6 +48,33 @@ class ExchangeFilters:
     def meets_min_notional(self, qty: float, price: float) -> bool:
         return qty > 0 and (qty * price) >= self.min_notional and qty >= self.min_qty
 
+    @classmethod
+    def from_ccxt_market(cls, market: dict) -> "ExchangeFilters":
+        """Build filters from a ccxt ``market`` dict (limits/precision).
+
+        Falls back to the class defaults for any field the exchange omits, so a
+        sparse or partial market description still yields usable filters. This
+        is the ONE place a live/paper executor sources its limits; the cost math
+        and the rounding/minNotional gate remain in this module so paper and
+        backtest agree by construction.
+        """
+        d = cls()
+        limits = (market or {}).get("limits", {}) or {}
+        precision = (market or {}).get("precision", {}) or {}
+        cost_min = (limits.get("cost", {}) or {}).get("min")
+        amt_min = (limits.get("amount", {}) or {}).get("min")
+        price_min = (limits.get("price", {}) or {}).get("min")
+        # ccxt precision.amount may be a step size (float) or decimal places
+        # (int). Only treat a sub-1 float as a literal step size.
+        amt_prec = precision.get("amount")
+        step = amt_prec if isinstance(amt_prec, float) and 0 < amt_prec < 1 else d.step_size
+        return cls(
+            min_notional=float(cost_min) if cost_min else d.min_notional,
+            step_size=float(step),
+            min_qty=float(amt_min) if amt_min else d.min_qty,
+            tick_size=float(price_min) if price_min else d.tick_size,
+        )
+
 
 @dataclass(frozen=True)
 class CostModel:

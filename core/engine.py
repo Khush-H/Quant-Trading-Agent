@@ -160,3 +160,234 @@ def submit_order(
     approved_order = decision.order
 
     return executor.execute(approved_order)
+
+
+# ---------------------------------------------------------------------------
+# Paper-trading: risk_check stub + the TradingDaemon.
+# ---------------------------------------------------------------------------
+import logging  # noqa: E402  (kept local to the paper section for clarity)
+from dataclasses import dataclass as _dataclass
+
+logger = logging.getLogger(__name__)
+
+
+@_dataclass(frozen=True)
+class RiskCheckResult:
+    """Outcome of :func:`risk_check`. ``approved`` gates the order path."""
+
+    approved: bool
+    order: Order
+    reason: Optional[str] = None
+
+
+def risk_check(order: Order, *, settings: Optional[Settings] = None) -> RiskCheckResult:
+    """The single risk chokepoint every daemon order must pass through.
+
+    STUB for the paper-trading step: it always approves and logs. It is the one
+    place the daemon consults before an order may reach an executor, so the real
+    risk rules can drop in here next phase WITHOUT changing the order path. Do
+    not weaken or bypass this — the contract is "risk_check runs before the
+    executor, unconditionally".
+    """
+    logger.info(
+        "risk_check(stub): APPROVE %s %s qty=%s", order.side.value, order.symbol,
+        order.quantity,
+    )
+    return RiskCheckResult(approved=True, order=order, reason="stub: always-approve")
+
+
+class TradingDaemon:
+    """PAPER-mode decision loop: wake hourly, infer, route deltas to a fill.
+
+    One cycle: fetch OHLCV -> DROP the forming candle -> build features on the
+    last CLOSED candle -> load the model (if present) -> infer P(Long). Act only
+    when confidence > threshold AND :func:`risk_check` approves. "Act" means
+    compute the target position, diff it via :class:`core.position.PositionManager`,
+    and route the delta through the paper executor. EVERY decision — including
+    holds/no-trades — is written to ``execution_logs`` with the simulated fee
+    and slippage.
+
+    PAPER ONLY. The daemon constructs the paper executor via the mode-keyed
+    factory; it never instantiates a live executor and there is no live path.
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        timeframe: str = "1h",
+        *,
+        settings: Optional[Settings] = None,
+        db=None,
+        position_manager=None,
+        executor=None,
+        predictor=None,
+        model_name: str = "paper_model",
+        equity: float = 10_000.0,
+    ) -> None:
+        from config import get_settings as _get_settings
+        from core.database import Database
+
+        self.settings = settings or _get_settings()
+        if self.settings.mode is not Mode.PAPER:
+            raise ValueError(
+                f"TradingDaemon is PAPER-only; configured mode is "
+                f"{self.settings.mode.value!r}. Set MODE=paper."
+            )
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.db = db or Database(self.settings)
+        self.db.init_schema()
+
+        from core.exchange import executor_for
+        from core.position import PositionManager
+
+        self.position_manager = position_manager or PositionManager(self.db)
+        self.executor = executor or executor_for(self.settings)
+        # `predictor` is an injectable callable(features_row) -> P(Long); when
+        # None the daemon loads the committed model lazily (see _infer).
+        self._predictor = predictor
+        self.model_name = model_name
+        self.equity = equity
+
+    # --- one decision cycle -------------------------------------------------
+    def run_once(self, ohlcv) -> dict:
+        """Run a single decision cycle on the supplied OHLCV frame.
+
+        ``ohlcv`` is the raw fetch (newest bar may be the forming one). Returns a
+        summary dict of the decision; also persists it to execution_logs.
+        """
+        import pandas as pd
+
+        from ml.features import build_features
+
+        if ohlcv is None or len(ohlcv) == 0:
+            return self._log_hold(ts=None, confidence=None, price=None,
+                                  reason="no OHLCV available")
+
+        # DROP the forming candle: the last row is the in-progress bar.
+        closed = ohlcv.iloc[:-1] if len(ohlcv) > 1 else ohlcv.iloc[0:0]
+        if len(closed) == 0:
+            return self._log_hold(ts=None, confidence=None, price=None,
+                                  reason="no closed candle after dropping forming bar")
+
+        feats = build_features(closed)
+        if len(feats) == 0:
+            return self._log_hold(ts=int(closed.index[-1]), confidence=None,
+                                  price=float(closed["close"].iloc[-1]),
+                                  reason="insufficient history to build features")
+
+        last_ts = int(feats.index[-1])
+        last_close = float(closed.loc[last_ts, "close"])
+        feature_row = feats.loc[[last_ts]]
+
+        proba = self._infer(feature_row, ts=last_ts, price=last_close)
+        if proba is None:  # no model available -> hold already logged
+            return self._log_hold(ts=last_ts, confidence=None, price=last_close,
+                                  reason="no committed model available")
+
+        # Decide target: long the full sized position iff confident enough.
+        threshold = self.settings.confidence_threshold
+        want_long = proba > threshold
+        target_qty = self._sized_qty(last_close) if want_long else 0.0
+
+        delta = self.position_manager.delta_to(self.symbol, target_qty)
+
+        from core.position import Action
+        if delta.action is Action.HOLD:
+            return self._log_hold(ts=last_ts, confidence=proba, price=last_close,
+                                  reason=f"target matches holding (p={proba:.3f})")
+
+        # Route through the SINGLE risk chokepoint before any executor.
+        side = Side.BUY if delta.action is Action.BUY else Side.SELL
+        order = Order(symbol=self.symbol, side=side, quantity=delta.quantity,
+                      limit_price=last_close)
+        decision = risk_check(order, settings=self.settings)
+        if not decision.approved:
+            return self._log(action=delta.action.value, ts=last_ts,
+                             confidence=proba, price=last_close, quantity=0.0,
+                             notional=0.0, fee=0.0, slippage=0.0, accepted=False,
+                             reason=f"risk_check rejected: {decision.reason}")
+
+        # Only now may the order reach the executor.
+        result = self.executor.execute(decision.order)
+        return self._apply_result(delta.action, result, ts=last_ts,
+                                  confidence=proba, ref_price=last_close)
+
+    # --- helpers ------------------------------------------------------------
+    def _infer(self, feature_row, *, ts: int, price: float):
+        """Return P(Long) for the feature row, or None if no model is available."""
+        if self._predictor is not None:
+            return float(self._predictor(feature_row))
+        # Lazy-load the committed model; hold if there isn't one.
+        from core.database import FEATURE_COLUMNS
+        from ml.train import FeatureMismatchError, load_model
+
+        try:
+            model = load_model(self.model_name, list(FEATURE_COLUMNS))
+        except FileNotFoundError:
+            return None
+        except FeatureMismatchError as exc:
+            logger.warning("Model load refused: %s", exc)
+            self._log_hold(ts=ts, confidence=None, price=price,
+                           reason=f"model feature mismatch: {exc}")
+            return None
+        self._predictor = lambda row: model.predict_proba(row)[:, 1][0]
+        return float(self._predictor(feature_row))
+
+    def _sized_qty(self, price: float) -> float:
+        """Fixed-fractional target size (20% of equity), matching the backtest."""
+        from backtest.engine import DEFAULT_POSITION_FRACTION
+
+        if price <= 0:
+            return 0.0
+        return (self.equity * DEFAULT_POSITION_FRACTION) / price
+
+    def _apply_result(self, action, result: OrderResult, *, ts, confidence,
+                      ref_price) -> dict:
+        from core.position import Action
+
+        if not result.accepted:
+            return self._log(action=action.value, ts=ts, confidence=confidence,
+                             price=ref_price, quantity=0.0, notional=0.0,
+                             fee=0.0, slippage=0.0, accepted=False,
+                             reason=result.reason)
+        qty = result.filled_quantity
+        fill_price = result.avg_price or ref_price
+        notional = qty * ref_price
+        # Recompute the simulated fee/slippage from the shared cost model so the
+        # logged numbers reconcile to the backtester exactly.
+        cm = getattr(self.executor, "cost_model", None)
+        if cm is not None:
+            fee = notional * cm.taker_fee
+            slippage = notional * (cm.slippage_bps / 10_000.0)
+        else:
+            fee = slippage = 0.0
+        # Persist the holding change.
+        self.position_manager.apply_fill(self.symbol, action, qty, fill_price)
+        return self._log(action=action.value, ts=ts, confidence=confidence,
+                         price=fill_price, quantity=qty, notional=notional,
+                         fee=fee, slippage=slippage, accepted=True,
+                         reason="paper fill (simulated)")
+
+    def _log_hold(self, *, ts, confidence, price, reason) -> dict:
+        return self._log(action="hold", ts=ts, confidence=confidence,
+                         price=price, quantity=0.0, notional=0.0, fee=0.0,
+                         slippage=0.0, accepted=True, reason=reason)
+
+    def _log(self, *, action, ts, confidence, price, quantity, notional, fee,
+             slippage, accepted, reason) -> dict:
+        self.db.log_execution(
+            mode=self.settings.mode.value, symbol=self.symbol,
+            timeframe=self.timeframe, action=action, ts=ts,
+            confidence=confidence, price=price, quantity=quantity,
+            notional=notional, fee=fee, slippage=slippage, accepted=accepted,
+            reason=reason,
+        )
+        summary = {
+            "action": action, "ts": ts, "confidence": confidence,
+            "price": price, "quantity": quantity, "notional": notional,
+            "fee": fee, "slippage": slippage, "accepted": accepted,
+            "reason": reason,
+        }
+        logger.info("decision: %s", summary)
+        return summary

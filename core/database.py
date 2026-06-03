@@ -37,7 +37,8 @@ from config import Settings, get_settings
 
 # Bumped whenever the schema in init_schema changes in a breaking way.
 # v2 adds the features table (features/labels phase).
-SCHEMA_VERSION = 2
+# v3 adds the execution_logs table (paper-trading phase).
+SCHEMA_VERSION = 3
 
 # Ordered feature columns written to the features table. The order is part of
 # the feature recipe and is hashed into feature_hash by ml.features.
@@ -189,6 +190,33 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_features_symbol_tf_ts
                     ON features (symbol, timeframe, ts);
+
+                -- Audit trail of every daemon decision, including no-trades.
+                -- One row per decision cycle per symbol. action is one of
+                -- 'buy' | 'sell' | 'hold'. For simulated (paper) fills the
+                -- realized fee and slippage are recorded so paper results can
+                -- be reconciled against the backtester's cost model. ts is the
+                -- CLOSED candle the decision was made on (epoch ms, UTC).
+                CREATE TABLE IF NOT EXISTS execution_logs (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decided_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    mode          TEXT    NOT NULL,
+                    symbol        TEXT    NOT NULL,
+                    timeframe     TEXT    NOT NULL,
+                    ts            INTEGER,
+                    action        TEXT    NOT NULL CHECK (action IN ('buy','sell','hold')),
+                    confidence    REAL,
+                    price         REAL,
+                    quantity      REAL    NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+                    notional      REAL    NOT NULL DEFAULT 0,
+                    fee           REAL    NOT NULL DEFAULT 0,
+                    slippage      REAL    NOT NULL DEFAULT 0,
+                    accepted      INTEGER NOT NULL DEFAULT 1,
+                    reason        TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_exec_logs_symbol_ts
+                    ON execution_logs (symbol, ts);
                 """
             )
             conn.execute(
@@ -317,3 +345,87 @@ class Database:
                 payload,
             )
         return len(payload)
+
+    # --- positions ----------------------------------------------------------
+    def get_position(self, symbol: str) -> Optional[sqlite3.Row]:
+        """Return the stored position row for ``symbol``, or None if flat/absent."""
+        with self.session() as conn:
+            return conn.execute(
+                "SELECT symbol, quantity, avg_entry_price, realized_pnl, "
+                "opened_at, updated_at FROM positions WHERE symbol = ?;",
+                (symbol,),
+            ).fetchone()
+
+    def upsert_position(
+        self,
+        symbol: str,
+        quantity: float,
+        avg_entry_price: float,
+        realized_pnl: float = 0.0,
+    ) -> None:
+        """Persist the current spot holding for ``symbol``.
+
+        Spot account: ``quantity`` must be ``>= 0`` (the table CHECK enforces it
+        too). A fully-closed position is ``quantity = 0``.
+        """
+        if quantity < 0:
+            raise ValueError(
+                f"Spot positions cannot be short: quantity={quantity!r} (>= 0)."
+            )
+        with self.session() as conn:
+            conn.execute(
+                "INSERT INTO positions "
+                "(symbol, quantity, avg_entry_price, realized_pnl, updated_at) "
+                "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+                "ON CONFLICT(symbol) DO UPDATE SET "
+                "quantity=excluded.quantity, "
+                "avg_entry_price=excluded.avg_entry_price, "
+                "realized_pnl=excluded.realized_pnl, "
+                "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');",
+                (symbol, float(quantity), float(avg_entry_price), float(realized_pnl)),
+            )
+
+    # --- execution logs -----------------------------------------------------
+    def log_execution(
+        self,
+        *,
+        mode: str,
+        symbol: str,
+        timeframe: str,
+        action: str,
+        ts: Optional[int] = None,
+        confidence: Optional[float] = None,
+        price: Optional[float] = None,
+        quantity: float = 0.0,
+        notional: float = 0.0,
+        fee: float = 0.0,
+        slippage: float = 0.0,
+        accepted: bool = True,
+        reason: Optional[str] = None,
+    ) -> int:
+        """Append one decision to ``execution_logs``. Returns the row id.
+
+        Every decision is logged, including holds/no-trades (action='hold',
+        quantity=0). For simulated fills ``fee`` and ``slippage`` carry the
+        cost the backtester's model would charge, so paper and backtest can be
+        reconciled.
+        """
+        with self.session() as conn:
+            cur = conn.execute(
+                "INSERT INTO execution_logs "
+                "(mode, symbol, timeframe, ts, action, confidence, price, "
+                " quantity, notional, fee, slippage, accepted, reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                (mode, symbol, timeframe, ts, action, confidence, price,
+                 float(quantity), float(notional), float(fee), float(slippage),
+                 1 if accepted else 0, reason),
+            )
+            return int(cur.lastrowid)
+
+    def recent_executions(self, symbol: str, limit: int = 20) -> list[sqlite3.Row]:
+        with self.session() as conn:
+            return conn.execute(
+                "SELECT * FROM execution_logs WHERE symbol = ? "
+                "ORDER BY id DESC LIMIT ?;",
+                (symbol, limit),
+            ).fetchall()

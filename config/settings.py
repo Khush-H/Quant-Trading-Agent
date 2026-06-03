@@ -93,6 +93,16 @@ class Settings(BaseSettings):
         ge=0,
         description="Per-leg slippage in basis points; applied to both legs.",
     )
+    # Minimum model confidence (P(Long)) for the trading daemon to act on a
+    # long signal. Default 0.50 (the oos_signal default). NOT 0.755 — that was
+    # a raw-score value from the failed turnover experiment, not a validated
+    # confidence threshold. Raise it deliberately once a model shows edge.
+    confidence_threshold: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+        description="P(Long) the daemon must exceed before acting on a long.",
+    )
 
     # --- Risk limits --------------------------------------------------------
     max_position_notional: float = Field(default=1000.0, gt=0)
