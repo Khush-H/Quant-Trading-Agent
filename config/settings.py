@@ -110,6 +110,35 @@ class Settings(BaseSettings):
     max_open_positions: int = Field(default=5, gt=0)
     max_leverage: float = Field(default=1.0, gt=0)
 
+    # --- Risk gate / circuit breaker (HALT) ---------------------------------
+    # Per-trade hard cap: a single order's notional may not exceed this
+    # fraction of NAV. Matches the backtest's 20% fixed-fractional sizing.
+    max_trade_fraction: float = Field(
+        default=0.20, gt=0, le=1.0,
+        description="Hard per-trade cap as a fraction of NAV (0.20 = 20%).",
+    )
+    # Total long exposure cap as a fraction of NAV. 0.20 = one full position
+    # (spot, long-only, single symbol, no pyramiding) so the cap actually binds.
+    max_total_exposure: float = Field(
+        default=0.20, gt=0,
+        description="Max summed position notional as a fraction of NAV.",
+    )
+    # HALT trips if rolling 24h drawdown is at or below this (negative) level.
+    halt_drawdown_pct: float = Field(
+        default=-3.0, le=0,
+        description="Rolling-24h drawdown (%) at/below which SYSTEM_HALT trips.",
+    )
+    # HALT trips after this many consecutive ccxt/exchange failures.
+    halt_max_consecutive_failures: int = Field(
+        default=5, gt=0,
+        description="Consecutive exchange failures that trip SYSTEM_HALT.",
+    )
+    # HALT trips if the heartbeat hasn't updated within this many minutes.
+    halt_heartbeat_timeout_minutes: float = Field(
+        default=15.0, gt=0,
+        description="Minutes without a heartbeat update before HALT trips.",
+    )
+
     # --- Web dashboard ------------------------------------------------------
     web_host: str = Field(default="127.0.0.1")
     web_port: int = Field(default=8000, gt=0, lt=65536)

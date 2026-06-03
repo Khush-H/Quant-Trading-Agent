@@ -135,7 +135,7 @@ def test_executor_not_reached_when_risk_check_rejects(tmp_path, monkeypatch):
     # A confident long would normally trade; force risk_check to REJECT.
     from core.engine import RiskCheckResult
 
-    def _reject(order, *, settings=None):
+    def _reject(order, **kwargs):
         return RiskCheckResult(approved=False, order=order, reason="blocked")
 
     monkeypatch.setattr(engine_mod, "risk_check", _reject)
@@ -152,9 +152,9 @@ def test_risk_check_runs_before_executor_when_approving(tmp_path, monkeypatch):
     order_seen = {"risk": None}
     real = engine_mod.risk_check
 
-    def _spy(order, *, settings=None):
+    def _spy(order, **kwargs):
         order_seen["risk"] = order
-        return real(order, settings=settings)
+        return real(order, **kwargs)
 
     monkeypatch.setattr(engine_mod, "risk_check", _spy)
     daemon, spy, db = _daemon_with_spy(tmp_path, predictor=lambda row: 0.99)
@@ -164,9 +164,16 @@ def test_risk_check_runs_before_executor_when_approving(tmp_path, monkeypatch):
     assert len(spy.calls) == 1                 # executor reached AFTER approval
 
 
-def test_risk_check_stub_always_approves():
-    res = risk_check(Order(symbol="BTC/USDT", side=Side.BUY, quantity=1.0))
-    assert res.approved is True
+def test_risk_check_approves_in_cap_buy(tmp_path):
+    # The chokepoint now delegates to the real RiskEngine. An in-cap buy on an
+    # initialized, un-halted DB is approved.
+    settings = _paper_settings(tmp_path)
+    db = Database(settings)
+    db.init_schema()
+    order = Order(symbol="BTC/USDT", side=Side.BUY, quantity=10.0, limit_price=100.0)
+    res = risk_check(order, settings=settings, db=db, nav=10_000.0,
+                     current_exposure=0.0)
+    assert res.approved is True  # 10*100 = 1000 <= 20% of 10_000
 
 
 # --- delta logic (spot, long-only) -------------------------------------------

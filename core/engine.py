@@ -180,20 +180,40 @@ class RiskCheckResult:
     reason: Optional[str] = None
 
 
-def risk_check(order: Order, *, settings: Optional[Settings] = None) -> RiskCheckResult:
+def risk_check(
+    order: Order,
+    *,
+    settings: Optional[Settings] = None,
+    db=None,
+    nav: Optional[float] = None,
+    current_exposure: float = 0.0,
+    now_ms: Optional[int] = None,
+) -> RiskCheckResult:
     """The single risk chokepoint every daemon order must pass through.
 
-    STUB for the paper-trading step: it always approves and logs. It is the one
-    place the daemon consults before an order may reach an executor, so the real
-    risk rules can drop in here next phase WITHOUT changing the order path. Do
-    not weaken or bypass this — the contract is "risk_check runs before the
-    executor, unconditionally".
+    Delegates to :meth:`core.risk.RiskEngine.approve` — the real rules
+    (SYSTEM_HALT circuit breaker, per-trade and total-exposure caps) live there.
+    The chokepoint INTERFACE is stable: callers still pass an ``order`` and get
+    a :class:`RiskCheckResult`; the daemon additionally supplies ``db``/``nav``/
+    ``current_exposure`` so sizing caps have a reference. Do not weaken or
+    bypass this — risk runs before the executor, unconditionally, for every
+    order including the HALT flatten-sell.
     """
-    logger.info(
-        "risk_check(stub): APPROVE %s %s qty=%s", order.side.value, order.symbol,
-        order.quantity,
+    from core.risk import RiskEngine
+
+    engine = RiskEngine(settings=settings, db=db)
+    decision = engine.approve(
+        order, nav=nav, current_exposure=current_exposure, now_ms=now_ms,
     )
-    return RiskCheckResult(approved=True, order=order, reason="stub: always-approve")
+    logger.info(
+        "risk_check: %s %s %s qty=%s -> %s (%s)",
+        "APPROVE" if decision.approved else "REJECT",
+        order.side.value, order.symbol, order.quantity,
+        decision.approved, decision.reason,
+    )
+    return RiskCheckResult(
+        approved=decision.approved, order=decision.order, reason=decision.reason,
+    )
 
 
 class TradingDaemon:
@@ -280,6 +300,33 @@ class TradingDaemon:
         last_close = float(closed.loc[last_ts, "close"])
         feature_row = feats.loc[[last_ts]]
 
+        # Heartbeat + NAV bookkeeping for the circuit breaker. Recorded every
+        # cycle BEFORE any decision so the breaker sees current state.
+        held_qty = self.position_manager.current_quantity(self.symbol)
+        nav = self._nav(held_qty, last_close)
+        self.db.record_heartbeat(last_ts)
+        self.db.record_nav(last_ts, nav)
+
+        # Evaluate the circuit breaker. If halted, flatten to cash (if holding)
+        # and refuse new entries. The flatten SELL still routes through the
+        # chokepoint — no bypass.
+        from core.risk import RiskEngine
+        from core.position import Action
+
+        halt_reason = RiskEngine(settings=self.settings, db=self.db).evaluate_halt(
+            now_ms=last_ts
+        )
+        if halt_reason is not None:
+            if held_qty > 0:
+                return self._route(
+                    Action.SELL, held_qty, ts=last_ts, confidence=None,
+                    ref_price=last_close, nav=nav,
+                    current_exposure=held_qty * last_close,
+                    intent=f"HALT flatten-to-cash ({halt_reason})",
+                )
+            return self._log_hold(ts=last_ts, confidence=None, price=last_close,
+                                  reason=f"SYSTEM_HALT active: {halt_reason}")
+
         proba = self._infer(feature_row, ts=last_ts, price=last_close)
         if proba is None:  # no model available -> hold already logged
             return self._log_hold(ts=last_ts, confidence=None, price=last_close,
@@ -292,26 +339,38 @@ class TradingDaemon:
 
         delta = self.position_manager.delta_to(self.symbol, target_qty)
 
-        from core.position import Action
         if delta.action is Action.HOLD:
             return self._log_hold(ts=last_ts, confidence=proba, price=last_close,
                                   reason=f"target matches holding (p={proba:.3f})")
 
-        # Route through the SINGLE risk chokepoint before any executor.
-        side = Side.BUY if delta.action is Action.BUY else Side.SELL
-        order = Order(symbol=self.symbol, side=side, quantity=delta.quantity,
-                      limit_price=last_close)
-        decision = risk_check(order, settings=self.settings)
-        if not decision.approved:
-            return self._log(action=delta.action.value, ts=last_ts,
-                             confidence=proba, price=last_close, quantity=0.0,
-                             notional=0.0, fee=0.0, slippage=0.0, accepted=False,
-                             reason=f"risk_check rejected: {decision.reason}")
+        return self._route(
+            delta.action, delta.quantity, ts=last_ts, confidence=proba,
+            ref_price=last_close, nav=nav,
+            current_exposure=held_qty * last_close,
+            intent="signal",
+        )
 
-        # Only now may the order reach the executor.
+    def _route(self, action, quantity, *, ts, confidence, ref_price, nav,
+               current_exposure, intent) -> dict:
+        """Route ONE order through the chokepoint, then the executor on approval."""
+        from core.position import Action
+
+        side = Side.BUY if action is Action.BUY else Side.SELL
+        order = Order(symbol=self.symbol, side=side, quantity=quantity,
+                      limit_price=ref_price)
+        # The SINGLE risk chokepoint. Nothing reaches the executor without it.
+        decision = risk_check(
+            order, settings=self.settings, db=self.db, nav=nav,
+            current_exposure=current_exposure, now_ms=ts,
+        )
+        if not decision.approved:
+            return self._log(action=action.value, ts=ts, confidence=confidence,
+                             price=ref_price, quantity=0.0, notional=0.0,
+                             fee=0.0, slippage=0.0, accepted=False,
+                             reason=f"risk_check rejected: {decision.reason}")
         result = self.executor.execute(decision.order)
-        return self._apply_result(delta.action, result, ts=last_ts,
-                                  confidence=proba, ref_price=last_close)
+        return self._apply_result(action, result, ts=ts, confidence=confidence,
+                                  ref_price=ref_price)
 
     # --- helpers ------------------------------------------------------------
     def _infer(self, feature_row, *, ts: int, price: float):
@@ -341,6 +400,17 @@ class TradingDaemon:
         if price <= 0:
             return 0.0
         return (self.equity * DEFAULT_POSITION_FRACTION) / price
+
+    def _nav(self, held_qty: float, price: float) -> float:
+        """Account NAV = starting equity + realized PnL + unrealized PnL.
+
+        Equivalent to cash + position value. Drives the drawdown breaker and the
+        percentage sizing caps. Reads realized PnL / avg entry from the stored
+        position so it survives restarts.
+        """
+        pos = self.position_manager.current(self.symbol)
+        unrealized = (price - pos.avg_entry_price) * held_qty if held_qty > 0 else 0.0
+        return self.equity + pos.realized_pnl + unrealized
 
     def _apply_result(self, action, result: OrderResult, *, ts, confidence,
                       ref_price) -> dict:

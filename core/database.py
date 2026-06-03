@@ -429,3 +429,80 @@ class Database:
                 "ORDER BY id DESC LIMIT ?;",
                 (symbol, limit),
             ).fetchall()
+
+    # --- risk-gate state (all in system_state; HALT must not self-clear) ----
+    # Keys used by the risk gate. Centralized so nothing typos a key name.
+    HALT_KEY = "SYSTEM_HALT"
+    HALT_REASON_KEY = "SYSTEM_HALT_REASON"
+    HEARTBEAT_KEY = "heartbeat_ts_ms"
+    EXCHANGE_FAILS_KEY = "exchange_consecutive_failures"
+    NAV_HISTORY_KEY = "nav_history"
+
+    def is_halted(self) -> bool:
+        return self.get_state(self.HALT_KEY) == "1"
+
+    def halt_reason(self) -> Optional[str]:
+        return self.get_state(self.HALT_REASON_KEY)
+
+    def set_halt(self, reason: str) -> None:
+        """Trip SYSTEM_HALT. Idempotent; never overwrites an earlier reason."""
+        if self.get_state(self.HALT_KEY) == "1":
+            return  # already halted; keep the original reason
+        self.set_state(self.HALT_KEY, "1")
+        self.set_state(self.HALT_REASON_KEY, reason)
+
+    def clear_halt(self) -> None:
+        """Clear SYSTEM_HALT. ONLY the manual reset script should call this.
+
+        HALT never self-clears anywhere in the engine/risk path — this method
+        exists solely for the operator-run reset.
+        """
+        self.set_state(self.HALT_KEY, "0")
+        self.set_state(self.HALT_REASON_KEY, "")
+
+    def record_heartbeat(self, ts_ms: int) -> None:
+        self.set_state(self.HEARTBEAT_KEY, str(int(ts_ms)))
+
+    def last_heartbeat_ms(self) -> Optional[int]:
+        v = self.get_state(self.HEARTBEAT_KEY)
+        return int(v) if v is not None and v != "" else None
+
+    def record_exchange_failure(self) -> int:
+        """Increment and return the consecutive-failure counter."""
+        cur = self.get_state(self.EXCHANGE_FAILS_KEY)
+        n = (int(cur) if cur not in (None, "") else 0) + 1
+        self.set_state(self.EXCHANGE_FAILS_KEY, str(n))
+        return n
+
+    def reset_exchange_failures(self) -> None:
+        self.set_state(self.EXCHANGE_FAILS_KEY, "0")
+
+    def exchange_consecutive_failures(self) -> int:
+        v = self.get_state(self.EXCHANGE_FAILS_KEY)
+        return int(v) if v not in (None, "") else 0
+
+    def record_nav(self, ts_ms: int, nav: float, keep_ms: int = 48 * 3_600_000) -> None:
+        """Append a (ts_ms, nav) sample to the rolling NAV history.
+
+        Stored as a JSON list in system_state; trimmed to ``keep_ms`` of recent
+        history so it can't grow unbounded. 48h kept by default (the 24h
+        drawdown window plus headroom).
+        """
+        import json
+
+        hist = self.nav_history()
+        hist.append([int(ts_ms), float(nav)])
+        cutoff = int(ts_ms) - keep_ms
+        hist = [p for p in hist if p[0] >= cutoff]
+        self.set_state(self.NAV_HISTORY_KEY, json.dumps(hist))
+
+    def nav_history(self) -> list[list]:
+        import json
+
+        v = self.get_state(self.NAV_HISTORY_KEY)
+        if not v:
+            return []
+        try:
+            return list(json.loads(v))
+        except (ValueError, TypeError):
+            return []
