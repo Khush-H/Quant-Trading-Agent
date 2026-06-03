@@ -7,8 +7,13 @@
   <style>
     :root { font-family: system-ui, sans-serif; }
     body { margin: 0; background: #0f1115; color: #e6e6e6; }
+    /* When halted the whole page goes red so it is impossible to miss. */
+    body.halted { background: #2a0d0d; }
     header { padding: 1rem 1.5rem; border-bottom: 1px solid #222; }
+    body.halted header { border-bottom-color: #5f1f1f; }
     h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
+    h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em;
+         color: #8a8f98; margin: 1.5rem 0 .5rem; }
     .mode {
       display: inline-block; margin-left: .75rem; padding: .15rem .6rem;
       border-radius: 999px; font-size: .75rem; font-weight: 700;
@@ -17,33 +22,122 @@
     .mode.paper    { background: #1f3a5f; color: #9ecbff; }
     .mode.backtest { background: #2d2d2d; color: #c9c9c9; }
     .mode.live     { background: #5f1f1f; color: #ff9e9e; }
-    main { padding: 1.5rem; }
+    main { padding: 1.5rem; max-width: 1100px; }
     .placeholder { color: #777; font-size: .9rem; }
+
+    /* The live banner — red, because real funds are at risk. */
     .live-warning {
       margin: 0 0 1rem; padding: .75rem 1rem; border-radius: 8px;
       background: #3a1414; color: #ffb3b3; border: 1px solid #5f1f1f;
       font-size: .85rem;
     }
+
+    /* Transient notice after a reset action. */
+    .notice {
+      margin: 0 0 1rem; padding: .6rem 1rem; border-radius: 8px;
+      font-size: .82rem; background: #14202c; color: #9ecbff;
+      border: 1px solid #25506f;
+    }
+
+    /* HALT panel: green/ok when clear, red when tripped. */
+    .halt {
+      margin: 0 0 1rem; padding: .85rem 1rem; border-radius: 8px;
+      font-size: .9rem; display: flex; align-items: center; gap: 1rem;
+      flex-wrap: wrap; justify-content: space-between;
+    }
+    .halt.ok      { background: #11251a; color: #8ee0a8; border: 1px solid #1f5f3a; }
+    .halt.tripped { background: #3a1414; color: #ffb3b3; border: 1px solid #d24; }
+    .halt .state  { font-weight: 700; letter-spacing: .03em; }
+    .halt .reason { color: #ffd0d0; font-size: .85rem; }
+    .halt form    { margin: 0; }
+    .halt button  {
+      background: #d24; color: #fff; border: none; border-radius: 6px;
+      padding: .45rem .9rem; font-weight: 600; cursor: pointer; font-size: .8rem;
+    }
+    .halt button:hover { background: #e35; }
+
+    .cards { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .card {
+      background: #14171d; border: 1px solid #222; border-radius: 8px;
+      padding: .9rem 1.1rem; min-width: 160px;
+    }
+    .card .label { font-size: .7rem; text-transform: uppercase;
+                   letter-spacing: .05em; color: #8a8f98; }
+    .card .value { font-size: 1.3rem; font-weight: 600; margin-top: .25rem; }
+    .pos  { color: #6fe09a; }
+    .neg  { color: #ff8a8a; }
+    .muted { color: #777; }
+
+    table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+    th, td { text-align: right; padding: .4rem .6rem; border-bottom: 1px solid #1c1f26; }
+    th:first-child, td:first-child,
+    th.l, td.l { text-align: left; }
+    th { color: #8a8f98; font-weight: 600; text-transform: uppercase;
+         font-size: .68rem; letter-spacing: .04em; }
+    tr.rejected td { color: #b07a7a; }
+    .tag { display: inline-block; padding: .05rem .4rem; border-radius: 4px;
+           font-size: .68rem; font-weight: 700; text-transform: uppercase; }
+    .tag.buy  { background: #11251a; color: #8ee0a8; }
+    .tag.sell { background: #2a1530; color: #d7a8ff; }
+    .tag.hold { background: #24262c; color: #aab; }
   </style>
 </head>
-<body>
+<body class="{{ BODY_CLASS }}">
   <header>
     <h1>
       Quant Trading Dashboard
-      <span class="mode {{ mode }}">{{ mode }}</span>
+      <span class="mode {{ MODE }}">{{ MODE }}</span>
     </h1>
   </header>
   <main>
-    {% if is_live %}
-    <p class="live-warning">
-      ⚠ LIVE mode — real funds are at risk. Orders still route through the risk
-      layer, but verify limits before trading.
-    </p>
-    {% endif %}
-    <p class="placeholder">
-      Scaffold. Positions, orders, and the equity curve are wired up during the
-      build (see README build order).
+    {{ RESET_NOTICE }}
+    {{ LIVE_WARNING }}
+    {{ HALT_PANEL }}
+
+    <h2>Rolling 24h</h2>
+    <div class="cards">
+      <div class="card">
+        <div class="label">24h PnL</div>
+        <div class="value {{ PNL_CLASS }}">{{ PNL_24H }}</div>
+      </div>
+      <div class="card">
+        <div class="label">24h Drawdown</div>
+        <div class="value {{ DD_CLASS }}">{{ DRAWDOWN_24H }}</div>
+      </div>
+      <div class="card">
+        <div class="label">Last Heartbeat</div>
+        <div class="value" style="font-size:.95rem;">{{ HEARTBEAT }}</div>
+      </div>
+    </div>
+
+    <h2>Position</h2>
+    {{ POSITIONS }}
+
+    <h2>Last 20 Executions</h2>
+    {{ EXECUTIONS }}
+
+    <p class="placeholder" style="margin-top:2rem;">
+      Read-only dashboard. It displays state and can reset SYSTEM_HALT; it never
+      places trades.
     </p>
   </main>
+
+  <script>
+    // Lightweight live refresh: re-fetch the read-only snapshot and reload when
+    // the HALT state flips, so the page colour tracks reality without manual
+    // refreshes. Polling only — it never POSTs.
+    (function () {
+      const wasHalted = {{ HALTED_JS }};
+      async function poll() {
+        try {
+          const r = await fetch('/api/state', { cache: 'no-store' });
+          if (!r.ok) return;
+          const s = await r.json();
+          if (s.halted !== wasHalted) location.reload();
+        } catch (_) { /* ignore transient errors */ }
+      }
+      setInterval(poll, 5000);
+    })();
+  </script>
 </body>
 </html>
