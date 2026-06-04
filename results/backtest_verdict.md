@@ -133,3 +133,145 @@ and a **long-only spot** account with the stated cost model. It is **not** a
 claim about the strategy family, other assets, other horizons, other feature
 sets, or other market regimes. A different horizon, richer features, or a
 trending regime could change the result; none of those were tested here.
+
+---
+---
+
+# BTC/USDT 4h + Funding Rate — Pre-registered Negative (Fourth)
+
+**Date:** 2026-06-04
+**Asset / timeframe:** BTC/USDT, 4h, spot, long-only (Flat/Long, no short, no
+leverage). Funding from the BTC/USDT:USDT perpetual (information source only —
+the account stays spot long-only).
+**Hypothesis (fresh information test, NOT a tweak to prior models):** derivatives
+positioning (funding rate + open interest) carries predictive information for BTC
+spot direction. Fresh, never-touched locked holdout.
+
+## Amendment to the pre-registration (made BEFORE any modeling)
+
+Open-interest **history is capped at ~30 days on every free ccxt source**
+(Binance & OKX ~30d; Bybit returns recent-only regardless of `since`). The
+intersection of OHLCV + funding + OI is therefore only ~30 days (~180 4h bars) —
+far too little for a feature warmup + walk-forward + 25% locked holdout. So the
+combined **funding+OI hypothesis is UNTESTABLE on available data and is deferred
+(untested, NOT rejected).** Funding-rate history, by contrast, goes back to 2019
+and is clean. The narrowed, pre-registered hypothesis actually tested here:
+**funding-rate positioning alone has predictive edge for BTC spot direction.**
+Acceptance rule (unchanged): positive net Sharpe **AND** beats buy-and-hold on
+the locked slice (read once), else terminate.
+
+## Data (two sources, point-in-time aligned)
+
+- **OHLCV 4h:** 14,808 real Binance bars, 2019-09-01 → 2026-06-04, deduped on
+  PK, forming candle dropped. 0 duplicates; **1 single-bar gap** (2020-02-19
+  12:00, known Binance outage — in the tuning region, immaterial to causality).
+- **Funding:** 7,377 settlements, 2019-09-10 → 2026-06-04, deduped, rates in
+  [−0.30%, +0.30%], **14.5% negative**. Settlement cadence varies over time
+  (8h → shorter); the point-in-time forward-fill is cadence-agnostic.
+- **Experiment domain = intersection** where both exist: ~14,752 4h candles.
+
+## Point-in-time settled-funding alignment (the critical rule)
+
+For a 4h candle closing at `t`, the funding feature is the **most recently
+SETTLED** funding rate with settlement timestamp `≤ t` (`searchsorted(side=
+"right") − 1`), forward-filled between settlements. A rate that settles **after**
+`t` is never used; values are never interpolated using a future settlement.
+
+**Leakage test (REQUIRED, new) — PASSES.** `tests/test_funding_pit_leakage.py`
+proves the derivatives analogue of the existing OHLCV no-overlap test: perturbing
+**any** funding value that settles after candle T's close leaves T's feature row
+**byte-identical** (and the whole prefix ≤ T unchanged); later rows *do* move
+(perturbation is real); bumping the in-force settled value *does* change T's row
+(anti-vacuity); per-candle boundary math verified. Runs green alongside the
+OHLCV causality test (full suite: 97 passed).
+
+## Features + labels
+
+6 causal OHLCV features + **2 funding features**: `funding_rate` (settled rate in
+force at the close) and `funding_z` (trailing z-score over the last **42 candles
+= 7 days**, `min_periods=window`, past-only — defines "extreme funding vs the
+recent regime"). Labels unchanged: Flat/Long, N=1 (next-4h forward return), 24bps
+round-trip hurdle. **Class balance: Long 36.75% / Flat 63.25%** — both ≫15%, no
+imbalance warning. 13,851 rows aligned with labels.
+
+## Time split
+
+Aligned rows 13,851 → tuning = first 75% (10,388), **LOCKED = last 25% (3,462)**,
+1-bar embargo at the seam. Barrier: tuning ends @ ts 1729108800000
+(2024-10-16 20:00), embargo bar 2024-10-17 00:00 dropped, locked begins @
+1729137600000 (2024-10-17 04:00). Locked untouched until the final read.
+
+## Tuning (walk-forward, threshold 0.50, net of 24bps) — round trips: **1,543**
+
+OOS 2020-08-20 → 2024-10-16, 8,655 bars, turnover 631×.
+
+| Metric | Strategy (net) | Buy & Hold BTC |
+|---|---:|---:|
+| Total return | −38.17% | +478.87% |
+| Net Sharpe | −1.32 | 1.01 |
+| Sortino | −1.10 | 1.01 |
+| Max drawdown | −45.59% | −77.04% |
+| Win rate | 47.8% | — |
+| Avg PnL/trade | −$2.47 | — |
+
+**Funding-sign breakdown (round trips by funding regime AT ENTRY):**
+
+| Regime | Trades | Total PnL | Avg PnL | Win% |
+|---|---:|---:|---:|---:|
+| **Negative** funding (short-squeeze / long-tradeable leg) | 193 | **+$102.61** | +$0.53 | 52.3% |
+| **Positive** funding (crowded-long / avoid leg) | 1,350 | **−$3,915.61** | −$2.90 | 47.1% |
+
+## LOCKED FINAL SLICE (single read, frozen config) — round trips: **578**
+
+Full coverage: all 3,462 locked rows predicted leakage-free (each scored by a
+model trained only on strictly-earlier, embargoed bars). OOS 2024-10-17 →
+2026-06-03, turnover 232×.
+
+| Metric | Strategy (net) | Buy & Hold BTC |
+|---|---:|---:|
+| Total return | **−18.26%** | −4.70% |
+| Net Sharpe | **−2.13** | +0.17 |
+| Sortino | −1.65 | +0.17 |
+| Max drawdown | −20.38% | −49.84% |
+| Win rate | 43.9% | — |
+| Avg PnL/trade | −$3.03 | — |
+
+**Funding-sign breakdown (locked):**
+
+| Regime | Trades | Total PnL | Avg PnL | Win% |
+|---|---:|---:|---:|---:|
+| **Negative** funding | 106 | −$115.66 | −$1.09 | 48.1% |
+| **Positive** funding | 472 | −$1,636.04 | −$3.47 | 43.0% |
+
+## Verdict — REJECT (terminate)
+
+Locked slice: **net Sharpe −2.13** and **−18.26% vs −4.70% B&H** — fails **both**
+acceptance conditions. **Funding-alone hypothesis rejected.** Trade counts are
+healthy (1,543 tuning / 578 locked), so this is a real out-of-sample negative,
+not a small-sample artifact.
+
+**Key finding (the reason the holdout matters):** the funding-sign asymmetry the
+hypothesis predicted *appeared in tuning exactly as expected* — the
+**negative-funding (short-squeeze) leg was the ONLY profitable bucket in tuning**
+(+$102.61, 52.3% win), while the positive-funding (crowded-long) leg caused the
+entire loss (−$3,915.61). But it **did NOT survive out-of-sample**: on the locked
+slice even the negative-funding leg went **negative** (−$115.66, 48.1% win). The
+apparent edge in the long-tradeable leg was **tuning-period noise**, caught by the
+locked holdout. A **negative-funding-only variant was deliberately NOT built** —
+selecting that leg after seeing it win in tuning, then testing it on the holdout,
+would be fishing the holdout and would invalidate the lockbox. The honest outcome
+stands: funding-alone rejected out-of-sample; funding+OI deferred as untestable.
+
+The strategy's only favorable dimension is, again, shallower drawdown (−20% vs
+−50% B&H) — a mechanical consequence of being in cash much of the time at high
+turnover, not skill.
+
+## Scope caveat
+
+Specific to: funding-rate + OHLCV features as defined, N=1 Flat/Long labels,
+XGBoost params as specified, threshold 0.50, BTC/USDT 4h, long-only spot, the
+stated cost model, and a tuning window dominated by 2020–24 / locked window of
+2024-10 → 2026-06. **Open interest was not tested** (deferred — no deep free
+history). Not a claim about the derivatives-information family, OI specifically,
+other assets/horizons/regimes, or a negative-funding-conditioned strategy (which
+was intentionally left untested to preserve the holdout).
