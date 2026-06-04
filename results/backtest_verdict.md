@@ -275,3 +275,114 @@ stated cost model, and a tuning window dominated by 2020–24 / locked window of
 history). Not a claim about the derivatives-information family, OI specifically,
 other assets/horizons/regimes, or a negative-funding-conditioned strategy (which
 was intentionally left untested to preserve the holdout).
+
+---
+---
+
+# Volatility-Targeted Sizing — Pre-registered Negative (Fifth & Final)
+
+**Date:** 2026-06-04
+**Asset / timeframe:** BTC/USDT, 4h, spot, long-only, no leverage. Same model,
+features, labels (N=1, 24bps), XGB params, walk-forward, and time split as the
+**fourth** experiment (the funding-feature model) — the SAME locked slice held
+out. This is a **sizing layer on the identical signal**, not a re-tuned model.
+**Hypothesis (tests ONE thing):** does volatility-scaled position sizing convert
+the model's signal into risk-adjusted edge that fixed-fractional sizing was
+hiding — or is any Sharpe improvement just variance compression that a sized
+benchmark gets for free?
+
+## Method (no engine change; rebalancing costs charged)
+
+The existing backtester takes a single scalar `position_fraction` and never
+rebalances a held position, so true vol-targeting cannot be expressed through it
+by a parameter alone. Per the pre-registered decision, the FIXED curves come from
+the **unchanged** `run_backtest`, while the SIZED model and SIZED buy-and-hold
+curves are built by a **separate vol-targeting layer** that rebalances per bar
+and charges every rebalance's traded notional through the **unchanged**
+`CostModel.fill_cost`. The SIZED model and SIZED B&H use the SAME layer, SAME
+cost model, and SAME frozen params, so the A/B and the dual benchmark are
+apples-to-apples. The rebalancing drag is included by construction (and confirmed
+charged: e.g. locked SIZED B&H added 1,376 rebalances, $50.9 cost).
+
+**Point-in-time vol (leakage check PASSES).** Vol at bar T = trailing 30-bar
+(5-day) RMS of 4h log returns, past-only, **no centering** (`sqrt(mean(r²))`).
+`tests/test_realized_vol_pit_leakage.py` proves perturbing any bar after T leaves
+T's vol byte-identical (and the whole prefix), a recent bar does move it
+(anti-vacuity), and the estimator is uncentered — green alongside the funding and
+OHLCV no-look-ahead tests.
+
+**Sizing rule:** `position_fraction(T) = clip(target_vol / realized_vol(T), 0,
+max_fraction)`, applied only when the model says Long. `max_fraction = 0.20` (the
+existing per-trade / exposure cap — scales DOWN freely, never exceeds 20%, no
+leverage). `target_vol` and `max_fraction` were chosen on the **TUNING region
+only** and frozen before the locked slice: `target_vol = 0.002669 / 4h (~12.5%
+ann.)`, anchored so median-vol Long bars hit the cap and high-vol bars scale down
+(genuine redistribution — fraction p5/p50/p95 = 0.10 / 0.20 / 0.20). An
+average-exposure-matched target_vol was rejected: with a 0.20 cap it forces
+fraction ≡ 0.20 everywhere (SIZED ≡ FIXED), which would be no test at all.
+
+## Round trips (prominent)
+
+Tuning: FIXED model **1,543** / SIZED model **1,538**. Locked: FIXED model
+**579** / SIZED model **575**. B&H = 1 entry each (plus per-bar rebalances on the
+sized variants). Healthy counts — not a small-sample artifact.
+
+## LOCKED FINAL SLICE — read once (OOS 2024-10-17 → 2026-06-04, 3,463 bars, full coverage, net 24bps)
+
+| Curve | Total return | Net Sharpe | Sortino | Max drawdown | Turnover |
+|---|---:|---:|---:|---:|---:|
+| FIXED model | −18.27% | **−2.13** | −1.65 | −20.4% | 232× |
+| SIZED model | −19.80% | **−2.52** | −1.90 | −21.0% | 224× |
+| FIXED buy-and-hold | −4.37% | **+0.17** | +0.18 | −49.8% | 1× |
+| **SIZED buy-and-hold** | −0.57% | **0.00** | 0.00 | **−12.3%** | 4× |
+
+(Tuning showed the same ordering: FIXED model Sharpe −1.32, SIZED model −1.63,
+FIXED B&H +1.01, **SIZED B&H +0.91** with maxDD compressed −77% → −22.9%.)
+
+## Verdict — sizing is risk-shaping, NOT edge creation (three independent reads)
+
+1. **Sizing made the model WORSE, not better — fails the A/B.** SIZED model Sharpe
+   is *below* FIXED model on both tuning (−1.63 vs −1.32) and locked (−2.52 vs
+   −2.13). There was no hidden edge for vol-targeting to surface; scaling a
+   zero-signal position just adds rebalancing cost to a loser.
+2. **Sized B&H beat the sized model — fails the dual benchmark.** SIZED B&H
+   (Sharpe 0.00 locked / +0.91 tuning) dominates SIZED model (−2.52 / −1.63). If
+   sizing conferred edge the sized *model* would beat the sized *benchmark*; it
+   does the opposite.
+3. **Vol-targeting's only real effect — drawdown compression — is free on naked
+   long BTC.** SIZED B&H cut maxDD −50% → −12% (locked) and −77% → −23% (tuning)
+   with **no model at all**. That is exactly the "variance compression a sized
+   benchmark gets for free" the experiment was built to expose. And it is not
+   even a free lunch on B&H: vol-targeting did not improve B&H Sharpe either
+   (1.01 → 0.91 tuning; 0.17 → 0.00 locked) — de-risking into high vol (which for
+   BTC often preceded recoveries) plus rebalancing drag costs return/Sharpe. It
+   is a risk-preference trade, not alpha.
+
+**Conclusion:** volatility-targeted sizing is a **risk-shaping tool (shallower
+drawdowns), not an edge-creation tool.** It cannot rescue a model with no
+directional signal, and any Sharpe-flattering it appears to produce is obtainable
+on a pure long-BTC position without the model.
+
+## Project termination (per the pre-registered commitment)
+
+This is the **fifth and final** pre-registered experiment. Across all five —
+(1) BTC 1h baseline, (2) the turnover-reduction threshold experiment, (3) SOL 1d
+fresh asset/horizon, (4) BTC 4h funding-rate information, and (5) this
+vol-targeted sizing layer — no configuration produced a tradeable edge on a
+never-seen locked slice, on either the **directional** axis (signal) or the
+**risk-adjusted** axis (sizing). Per the commitment registered before this run,
+that result **terminates the project**: the premise — *a solo developer
+extracting durable directional or risk-adjusted edge from OHLCV (+ derivatives
+features) with an XGBoost Flat/Long classifier and this cost model* — is
+**rejected**. The pipeline is sound and the negatives are honest (passing
+leakage/causality tests, lockbox discipline held every time); the edge simply is
+not there at this scope.
+
+## Scope caveat
+
+Specific to: this sizing rule (30-bar RMS vol, target_vol 0.002669/4h,
+max_fraction 0.20), the fourth experiment's model/features/labels, BTC/USDT 4h,
+long-only spot, the stated cost model, and the 2024-10 → 2026-06 locked window.
+Not a claim that vol-targeting is useless in general (it demonstrably shapes
+drawdown), nor about leveraged/multi-asset risk-parity sizing, other models, or
+other regimes — only that, here, it creates no edge a sized benchmark lacks.
