@@ -1,153 +1,164 @@
-# Quant Trading System
+# Quant Trading Agent
 
-A local quantitative trading system for crypto, built on a strict
-**backtest → paper → live** promotion path. The defining design choice is that
-**every order — simulated, paper, or live — flows through a single gateway**, so
-the risk layer can never be bypassed.
+A production-grade quantitative trading research pipeline built 
+backtester-first, with a hard performance gate before any live 
+infrastructure is built. The pipeline was used to run five 
+pre-registered experiments testing whether a solo developer can 
+extract directional or risk-adjusted edge from OHLCV and 
+derivatives data using XGBoost. The answer, across all five, 
+was no — and that is the result, not a failure.
 
-> ⚠️ This repo is currently a **scaffold**. Config and guardrails are real and
-> tested; trading logic is intentionally not implemented yet (most functions
-> raise `NotImplementedError`). Build it out in the order below.
+## The Core Principle
 
----
+> The backtester is a gate, not a step.
 
-## Safety model (read this first)
+Phases 0–4 (data → features → labels → train → backtest) produce 
+one verdict: does this beat buy-and-hold net of costs, 
+out-of-sample? Phases 5–8 (paper engine, risk gate, dashboard, 
+live) are only worth building if that verdict is yes.
 
-Three guardrails are enforced in code, not by convention:
+The gate returned no across five pre-registered experiments. The 
+live execution path (Phase 8) was never enabled. The paper engine, 
+risk gate, and dashboard were built as a pure engineering exercise 
+with the live path hard-gated behind `LIVE_TRADING_CONFIRMED=true`.
 
-1. **One mode, paper by default.** `MODE` is `backtest | paper | live` and
-   defaults to `paper` (`config/settings.py`). There is no code path that
-   defaults into live.
-2. **Live is gated.** `MODE=live` refuses to even construct settings unless
-   `LIVE_TRADING_CONFIRMED=true` *and* exchange credentials are present.
-   `scripts/run_live.py` re-checks both before doing anything.
-3. **One order gateway.** All orders go through `core.engine.submit_order`,
-   which runs the risk layer *before* dispatching to the mode-appropriate
-   executor (`SimulatedExecutor` / `PaperExecutor` / `LiveExecutor`). Strategy
-   code must never call an executor directly. The backtest uses the *same*
-   gateway, so a strategy that passes risk in backtest behaves identically in
-   paper and live.
+## Architecture
+core/          position manager, exchange wrapper, trading daemon,
+risk engine
+ml/            features, labels, walk-forward training
+backtest/      event-driven backtester, cost model, metrics
+web/           read-only FastAPI dashboard
+config/        pydantic-settings, all secrets from env vars
+tests/         100 tests, all passing
+scripts/       fetch, backtest, paper trading, halt reset
+results/       backtest_verdict.md — the full experiment record
 
-Secrets (API keys, DB URL) come **only** from environment variables. `.env` is
-git-ignored; copy `.env.example` to `.env` for local development.
+**Stack:** Python 3.13, XGBoost, CCXT, FastAPI, SQLite (WAL).  
+**Execution:** spot only, long-only, no shorting, no leverage 
+anywhere in the codebase.  
+**Single chokepoint:** every order routes through 
+`risk_check(order)` before reaching any executor — enforced by 
+tests that assert the executor is never called when `risk_check` 
+rejects.
 
----
+## Leakage Guarantees
 
-## Project layout
+The pipeline's most important property is that it cannot lie to 
+itself. Three independent guarantees are enforced and tested:
 
-```
-config/      settings.py — pydantic-settings; MODE + live gate + all secrets
-core/        database.py  — persistence (OHLCV, orders, fills, positions)
-             engine.py    — Order types + submit_order (THE order gateway)
-             risk.py      — RiskEngine.check(); the only approver/resizer
-             position.py  — position & PnL tracking
-             exchange.py  — ccxt client + the 3 per-mode executors
-ml/          features.py  — causal feature engineering
-             labels.py    — supervised targets (no look-ahead)
-             train.py     — XGBoost training (walk-forward)
-             models/      — trained artifacts (git-ignored)
-backtest/    engine.py    — replay loop (routes orders via submit_order)
-             costs.py     — fees + slippage model
-             metrics.py   — Sharpe, drawdown, hit rate, ...
-web/         app.py       — FastAPI read-only dashboard (mode banner)
-             templates/   — Jinja2 templates
-scripts/     fetch_data.py, run_backtest.py, run_paper.py, run_live.py
-tests/       guardrail + gateway tests
-```
+**OHLCV no-overlap test:** perturbing any bar after time T leaves 
+T's feature row byte-identical. Perturbing any bar before T leaves 
+T's label unchanged. Proven by `tests/test_features_labels.py`.
 
----
+**Funding rate point-in-time test:** for each 4h candle closing at 
+T, the funding feature uses only the most recently *settled* rate 
+at or before T. Perturbing any settlement after T's close leaves 
+T's feature row byte-identical. Proven by 
+`tests/test_funding_pit_leakage.py`.
+
+**Realized volatility point-in-time test:** the vol estimate at T 
+uses only data through T's close, uncentered. Perturbing any bar 
+after T leaves T's vol estimate byte-identical. Proven by 
+`tests/test_realized_vol_pit_leakage.py`.
+
+A pipeline with lookahead leakage produces beautiful backtests. 
+These tests prove the negative results are real.
+
+## The Five Experiments
+
+All five were pre-registered (hypothesis and acceptance rule stated 
+before any data was touched), evaluated on a locked holdout read 
+exactly once, and accepted as written.
+
+| # | Config | Tuning | Locked | Verdict |
+|---|--------|--------|--------|---------|
+| 1 | BTC/USDT 1h, raw signal | −38% / Sharpe −1.32 | −47% / −8.03 | REJECT |
+| 2 | BTC/USDT 1h, isotonic calibration + turnover-anchored threshold | +0.02% / 0.04 | 0 trades (null by construction) | REJECT |
+| 3 | SOL/USDT 1d | +25% / 0.50 | −5.71% / −0.31 | REJECT |
+| 4 | BTC/USDT 4h + funding rate feature (PIT-aligned, leakage-tested) | −38% / −1.32 | −18% / −2.13 | REJECT |
+| 5 | BTC/USDT 4h, vol-targeted sizing (4-way A/B vs fixed + sized B&H) | FIXED −38%/−1.32, SIZED −38%/−1.63, FIXED B&H +479%/1.01, SIZED B&H +44%/0.91 | FIXED −18%/−2.13, SIZED −20%/−2.52, FIXED B&H −4%/0.17, SIZED B&H −0.6%/0.00 | REJECT |
+
+**Experiment 5 dual-benchmark finding:** vol-targeted sizing made 
+the model *worse* than fixed sizing on both tuning and locked 
+(−2.52 vs −2.13 Sharpe). The sized buy-and-hold benchmark beat the 
+sized model on every metric, confirming that any Sharpe improvement 
+from vol-targeting is free variance compression, not model edge.
+
+**Experiment 4 funding-sign finding:** the negative-funding 
+(short-squeeze) leg was the only profitable bucket in tuning 
+(+$103, 52% win) — exactly as hypothesized. On the locked slice it 
+went negative (−$116, 48% win). The apparent edge was 
+tuning-period noise, caught by the holdout. A 
+negative-funding-only variant was deliberately not built, as that 
+would have been fishing the holdout.
+
+Full details, cost reconciliation, and regime caveats for all five 
+experiments are in `results/backtest_verdict.md`.
+
+## Why Negative Results Are the Credential
+
+A pipeline with lookahead leakage or data snooping produces 
+positive results almost automatically. The tests above prove these 
+results are clean. The consistent finding across two assets, two 
+timeframes, an orthogonal information source, and a risk-adjusted 
+sizing layer is itself a result: a tree model on OHLCV and 
+publicly-available derivatives data does not have a durable edge 
+net of costs, at these horizons, for a solo developer without 
+co-location or proprietary data.
+
+The more important demonstration is methodological: every 
+experiment was pre-registered, the acceptance rule was committed 
+before results were seen, the locked holdout was read exactly once, 
+and the verdict was accepted — including when tuning data showed 
+apparent edge that died out-of-sample.
+
+## Risk Engine
+
+`core/risk.py` implements a real circuit-breaker:
+- Trips `SYSTEM_HALT` on rolling 24h drawdown ≤ −3%, N 
+  consecutive exchange failures, or stale heartbeat
+- When halted: blocks BUYs, allows SELLs (flatten to cash routes 
+  through the same `risk_check` chokepoint — no bypass path)
+- HALT never self-clears; manual reset only via 
+  `scripts/reset_halt.py --confirm`
+- Tested: a −3% drawdown seeds the halt from the real evaluation 
+  path, then asserts a 0.99-confidence long is refused and the 
+  position is flattened
+
+## Dashboard
+
+Read-only FastAPI dashboard at `localhost:8000`. Opens SQLite in 
+`?mode=ro` (engine-level write rejection as defense-in-depth). 
+Displays mode, position, last 20 executions with fee/slippage, 
+rolling 24h PnL and drawdown, HALT state and reason, heartbeat. 
+The only state-changing endpoint is `POST /reset-halt`, which 
+requires explicit `confirm` and routes through the same guarded 
+`clear_halt` path as the manual script.
 
 ## Setup
 
 ```bash
 python -m venv .venv
-# Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
-# macOS/Linux:
-# source .venv/bin/activate
-
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-copy .env.example .env      # PowerShell: Copy-Item .env.example .env
-pytest                      # guardrail tests should pass on the scaffold
+cp .env.example .env             # fill in your exchange keys
+pytest                           # 100 tests, all should pass
 ```
 
-Pinned versions (do not loosen casually): `ccxt==4.2.14`, `xgboost==2.0.3`,
-`pandas==2.2.0`, `numpy==1.26.4`, `scikit-learn==1.4.0`, `fastapi==0.109.2`,
-`uvicorn==0.27.1`, `pydantic==2.6.1`.
-
----
-
-## Build order
-
-Build strictly in this sequence. Each step depends on the one before it, and
-the ordering is deliberate — costs and risk are introduced *before* anything
-touches real money.
-
-1. **Data** — `scripts/fetch_data.py`, `core/database.py`.
-   Fetch and persist clean OHLCV. Everything downstream needs trustworthy data
-   first. Read-only against the exchange.
-
-2. **Features / Labels** — `ml/features.py`, `ml/labels.py`.
-   Build a strictly *causal* feature matrix and aligned targets. Get this wrong
-   (look-ahead) and every later result is fiction.
-
-3. **Backtest** — `backtest/engine.py`, `backtest/costs.py`,
-   `backtest/metrics.py`.
-   Replay history through `submit_order`, *with realistic costs*. Establish the
-   metrics you trust before you trust any model. Build the backtest **before**
-   training so the model is judged against costs, not on paper accuracy.
-
-4. **Train** — `ml/train.py`.
-   Train the XGBoost model with walk-forward / purged validation. Evaluate it
-   through the step-3 backtest, not in isolation.
-
-5. **Paper** — `scripts/run_paper.py`, `core/exchange.py` (`PaperExecutor`).
-   Run on **live prices with simulated fills**. Same gateway, same risk layer —
-   this is the dress rehearsal for live.
-
-6. **Risk** — `core/risk.py`, `core/position.py`.
-   Harden the risk layer: notional/leverage caps, open-position limits, daily
-   loss limits, drawdown stops. (The interface exists from day one; this is
-   where the real rules and stateful checks land, validated against paper.)
-
-7. **Dashboard** — `web/app.py`.
-   Wire the read-only monitoring surface to live state: positions, orders,
-   equity curve. Display the active mode prominently. The dashboard never
-   places orders.
-
-8. **Live** — `scripts/run_live.py`, `core/exchange.py` (`LiveExecutor`).
-   Final step, only after paper + hardened risk are proven. Requires
-   `MODE=live` **and** `LIVE_TRADING_CONFIRMED=true` **and** credentials. Start
-   with the smallest possible size.
-
----
-
-## Running
-
+To run the paper daemon (no live execution without 
+`LIVE_TRADING_CONFIRMED=true`):
 ```bash
-# Fetch data (mode-agnostic, read-only)
-python -m scripts.fetch_data --symbol BTC/USDT --timeframe 1h
-
-# Backtest (forces MODE=backtest)
-python -m scripts.run_backtest --symbol BTC/USDT --timeframe 1h
-
-# Paper trading (forces MODE=paper) — the default, safe loop
-python -m scripts.run_paper
-
-# Dashboard
-uvicorn web.app:app --host 127.0.0.1 --port 8000
-
-# LIVE — real money. You must opt in explicitly; nothing defaults here:
-#   MODE=live LIVE_TRADING_CONFIRMED=true python -m scripts.run_live
+python scripts/run_paper.py
 ```
 
----
+To view the dashboard:
+```bash
+uvicorn web.app:app --host 127.0.0.1 --port 8000
+```
 
-## Conventions
+## What Is Not Built
 
-- Never read secrets from `os.environ` directly — import `get_settings()` from
-  `config`.
-- Never call an executor's `execute()` directly — always go through
-  `core.engine.submit_order`.
-- Keep features causal and backtests costed; treat both as correctness issues,
-  not nice-to-haves.
+`scripts/run_live.py` exists as a scaffold but live execution is 
+not implemented. It requires `LIVE_TRADING_CONFIRMED=true` and 
+`--i-understand-the-risks`. It will not be enabled until a 
+different model clears the Phase 3 gate on a clean holdout.
