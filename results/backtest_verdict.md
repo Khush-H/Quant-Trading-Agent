@@ -564,3 +564,79 @@ holdout. The repeated criterion-2 failure pattern (signal real but below the
 asset's own bull-window Sharpe) is an observation, not a tested hypothesis
 about regime-conditioned deployment — that would require a new pre-registered
 experiment.
+
+---
+---
+
+# BTC/USDT 1h + Coinbase Premium — REJECT at the Tuning Gate (Eighth)
+
+**Date:** 2026-06-10
+**Asset / timeframe:** BTC/USDT, 1h, spot, long-only (Flat/Long, no short, no
+leverage), executed on Binance. Signal source: the Coinbase−Binance price
+premium, ``(coinbase_close − binance_close) / binance_close × 100``, both
+closes from the same closed 1h bar (T-inclusive, no lag needed).
+**Hypothesis:** US-venue price leadership (the Coinbase premium) carries
+predictive information for BTC direction at the 1h horizon.
+
+## Pre-registered design
+
+- **Tuning window:** 2019-01-01 → 2021-01-01. **Locked holdout:** 2021-01-01 →
+  2023-01-01 hard cap.
+- **Data:** dual-exchange fetch (Coinbase Advanced Trade 300-candle pages +
+  Binance), aligned on UTC hours by strict intersection. 34,999 aligned hours
+  of an expected 35,064; **65 misaligned hours dropped (0.185%, under the 1%
+  stop-rule)**, never forward-filled. Atomic parquet cache + alignment-audit
+  sidecar.
+- **Exactly three features** appended after the unchanged 6 OHLCV features:
+  `coinbase_premium` (raw, at the closed bar T), `premium_zscore_168h`
+  (168-bar z ending at T, min_periods=168, std 0/NaN → 0), `premium_mom_24h`
+  (`premium[T]/premium[T-24] − 1`, denom 0/NaN → 0).
+- **PIT rule (T-inclusive):** row T uses only premium values dated T or
+  earlier. Proven by `tests/test_coinbase_premium_pit_leakage.py`: perturbation
+  invariance on 100 sampled rows (corrupt strictly-after-T → byte-identical),
+  literal recompute, anti-vacuity on all three features, and a deliberate
+  T+1 injection caught. Full suite 114 passed.
+- Everything else unchanged: labels (N=1, 24bps), XGB params, walk-forward
+  (5 splits, embargo = label horizon), costs (10bps taker + 2bps slippage per
+  side), threshold 0.50, 20% fixed-fractional, long-only.
+
+## Tuning window (walk-forward OOS 2019-05-04 → 2020-12-31, 14,535 bars, net of 24bps)
+
+| Metric | Strategy (net) | Buy & Hold BTC |
+|---|---:|---:|
+| Net Sharpe | **−2.54** (gross **+1.68**) | **+1.68** |
+| Total return | **−41.27%** (gross +26.93%) | +402.64% |
+| Max drawdown | −46.78% | −70.41% |
+| Round trips | 1,876 (win rate 38.6%) | — |
+| Avg PnL/trade | **−$2.20** | — |
+| Turnover | **765.5×** | — |
+
+## Verdict — REJECT at the tuning gate; HOLDOUT NOT RUN
+
+Decision (user, pre-holdout): with negative per-trade economics (−$2.20)
+across 1,876 out-of-sample trades, a 38.6% win rate, and 765× turnover,
+running the holdout is not scientifically justified — the configuration
+cannot pass criterion 3 (avg PnL/trade > 0) on any plausible holdout, and
+reading the locked slice would spend it for nothing. **The 2021-01-01 →
+2023-01-01 holdout was never read and remains locked** (holdout-era 1h
+candles were never even fetched into the DB).
+
+**Key finding:** the third repeat of the cost-structure result, now with the
+cleanest gross/net separation yet. The premium signal has real gross edge —
+gross Sharpe +1.68 (matching buy-and-hold's Sharpe on the same window) and
++26.9% gross return — but the 1h horizon forces 765× turnover, and the
+~68-percentage-point gross-to-net gap destroys it entirely. Compare
+experiment 1 (1h OHLCV: gross +1.13 → net −8.03) and experiments 6–7
+(1d on-chain: costs survivable, gross 1.61 → net 1.07). The pattern across
+eight experiments: this cost model admits daily-horizon signals and
+annihilates hourly ones. A gross signal may exist in the Coinbase premium but
+it is not accessible at this frequency with this cost model.
+
+## Scope caveat
+
+Specific to: these three premium feature definitions, N=1 Flat/Long labels at
+24bps, XGBoost as specified, threshold 0.50, BTC/USDT 1h on Binance with the
+stated cost model, and the 2019–2021 tuning window. NOT a holdout-validated
+negative (the holdout was deliberately preserved unread). Not a claim about
+the premium at other horizons (e.g. 1d aggregation), maker-fee execution,
+or as a filter on a lower-frequency strategy — none of those were tested.

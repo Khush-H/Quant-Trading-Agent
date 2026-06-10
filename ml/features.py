@@ -39,6 +39,22 @@ trading day D uses only AdrActCnt dated D-1 or earlier — proven by
   z-score of close (pipeline convention).
 
 Without ``onchain`` the output is unchanged: exactly :data:`FEATURE_COLUMNS`.
+
+Coinbase-premium features (Experiment 8, optional, 1h only)
+-----------------------------------------------------------
+When :func:`build_features` is given a ``premium`` frame (the aligned
+dual-exchange series from :mod:`src.onchain.coinbase_premium_fetcher`),
+exactly three more columns are APPENDED after every existing feature,
+computed by :mod:`src.onchain.premium_features` under a T-inclusive PIT rule
+(the premium at T comes from both exchanges' CLOSED bars at T; rolling
+windows never reach past T — proven by
+``tests/test_coinbase_premium_pit_leakage.py``):
+
+* ``coinbase_premium``     — raw premium at the closed bar T.
+* ``premium_zscore_168h``  — 168-bar rolling z-score ending at T.
+* ``premium_mom_24h``      — ``premium[T] / premium[T-24] - 1``.
+
+Without ``premium`` the output is unchanged.
 """
 
 from __future__ import annotations
@@ -56,6 +72,12 @@ from src.onchain.features import (
     ADR_Z_WINDOW,
     ONCHAIN_FEATURE_COLUMNS,
     add_onchain_features,
+)
+from src.onchain.premium_features import (
+    PREMIUM_FEATURE_COLUMNS,
+    PREMIUM_MOM_LAG,
+    PREMIUM_Z_WINDOW,
+    add_premium_features,
 )
 
 # Lookback windows. Kept as named constants because they are part of the
@@ -102,7 +124,9 @@ def _garman_klass_vol(df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.sqrt(var), index=df.index)
 
 
-def compute_feature_hash(include_onchain: bool = False) -> str:
+def compute_feature_hash(
+    include_onchain: bool = False, include_premium: bool = False
+) -> str:
     """Stable hash of the feature RECIPE (not of any data).
 
     Combines the ordered feature names, the lookback parameters, and the
@@ -129,12 +153,21 @@ def compute_feature_hash(include_onchain: bool = False) -> str:
             f"adr_mom={ADR_MOM_LAG}",
             "adr_lag=1",
         ]
+    if include_premium:
+        parts += [
+            "premium=" + ",".join(PREMIUM_FEATURE_COLUMNS),
+            f"prem_z={PREMIUM_Z_WINDOW}",
+            f"prem_mom={PREMIUM_MOM_LAG}",
+            "prem_lag=0",
+        ]
     recipe = "|".join(parts)
     return hashlib.sha256(recipe.encode("utf-8")).hexdigest()[:16]
 
 
 def build_features(
-    ohlcv: pd.DataFrame, onchain: Optional[pd.DataFrame] = None
+    ohlcv: pd.DataFrame,
+    onchain: Optional[pd.DataFrame] = None,
+    premium: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Return the causal feature matrix for one symbol/timeframe.
 
@@ -149,6 +182,12 @@ def build_features(
     every existing feature, computed under the D-1 point-in-time lag by
     :func:`src.onchain.features.add_onchain_features`. Existing columns are
     not touched.
+
+    ``premium`` (1h candles only): the aligned Coinbase/Binance frame from
+    :mod:`src.onchain.coinbase_premium_fetcher`. When given, the three
+    Experiment-8 premium columns are appended after everything else under the
+    T-inclusive PIT rule via
+    :func:`src.onchain.premium_features.add_premium_features`.
 
     Causality: every feature at row t depends only on close/volume/OHLC at t
     and earlier (and, for the on-chain columns, AdrActCnt dated t-1 or
@@ -179,6 +218,11 @@ def build_features(
         # Appended strictly AFTER all existing features; same index, so the
         # shared dropna below also drops on-chain warmup rows.
         feats = feats.join(add_onchain_features(ohlcv, onchain))
+    if premium is not None:
+        # Appended last. NaN raw-premium rows (alignment-dropped hours) fall
+        # to the shared dropna; z-warmup and momentum-gap rows are 0-filled
+        # per the registered fill rules, not dropped.
+        feats = feats.join(add_premium_features(ohlcv, premium))
     return feats.dropna()
 
 
