@@ -1,4 +1,8 @@
-"""Experiment 6 runner: BTC/USDT 1d walk-forward with on-chain AdrActCnt features.
+"""Experiment 6/7 runner: 1d walk-forward with on-chain AdrActCnt features.
+
+Experiment 6: BTC/USDT + btc AdrActCnt (the defaults). Experiment 7 is the
+pre-registered replication on ETH/USDT + eth AdrActCnt — same windows, costs,
+labels, walk-forward, and threshold; only the asset pair changes.
 
 Pre-registered windows (hard-coded; not flags, so they cannot drift):
 
@@ -30,7 +34,11 @@ import os
 
 import pandas as pd
 
-SYMBOL = "BTC/USDT"
+# Experiment 6 defaults; Experiment 7 passes --symbol ETH/USDT --onchain-asset
+# eth. Windows, costs, labels, walk-forward, and threshold are SHARED and
+# fixed — replication changes the asset pair only.
+DEFAULT_SYMBOL = "BTC/USDT"
+DEFAULT_ONCHAIN_ASSET = "btc"
 TIMEFRAME = "1d"
 THRESHOLD = 0.50  # pipeline default; pre-registered, not tuned
 N_SPLITS = 5      # pipeline default
@@ -47,11 +55,11 @@ _WINDOWS = {
 }
 
 
-def _load_capped_ohlcv(db, start_ms: int, end_ms: int) -> pd.DataFrame:
-    rows = db.load_candles(SYMBOL, TIMEFRAME)
+def _load_capped_ohlcv(db, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    rows = db.load_candles(symbol, TIMEFRAME)
     if not rows:
         raise SystemExit(
-            f"No candles for {SYMBOL} {TIMEFRAME}. Run scripts.fetch_data first."
+            f"No candles for {symbol} {TIMEFRAME}. Run scripts.fetch_data first."
         )
     ohlcv = pd.DataFrame([dict(r) for r in rows]).set_index("ts").sort_index()
     ohlcv = ohlcv.loc[(ohlcv.index >= start_ms) & (ohlcv.index < end_ms)]
@@ -61,10 +69,10 @@ def _load_capped_ohlcv(db, start_ms: int, end_ms: int) -> pd.DataFrame:
     return ohlcv
 
 
-def _load_capped_onchain(end_ms: int) -> pd.DataFrame:
+def _load_capped_onchain(asset: str, end_ms: int) -> pd.DataFrame:
     from src.onchain.coinmetrics_fetcher import load_adr_act_cnt
 
-    adr = load_adr_act_cnt()  # parquet cache; no network on reruns
+    adr = load_adr_act_cnt(asset=asset)  # parquet cache; no network on reruns
     # The D-1 lag inside the feature builder is the real guarantee (proven by
     # tests/test_onchain_pit_leakage.py); capping the frame at the window end
     # is an extra fence so out-of-window data is not even present in memory.
@@ -85,7 +93,11 @@ def _gross_curve(equity: pd.Series, trades: pd.DataFrame) -> pd.Series:
     return equity + cum_costs
 
 
-def run(window: str) -> dict:
+def run(
+    window: str,
+    symbol: str = DEFAULT_SYMBOL,
+    onchain_asset: str = DEFAULT_ONCHAIN_ASSET,
+) -> dict:
     from backtest.engine import run_backtest
     from backtest.metrics import sharpe, total_return
     from config import get_settings
@@ -102,8 +114,8 @@ def run(window: str) -> dict:
     db = Database(settings)
     start_ms, end_ms = _WINDOWS[window]
 
-    ohlcv = _load_capped_ohlcv(db, start_ms, end_ms)
-    adr = _load_capped_onchain(end_ms)
+    ohlcv = _load_capped_ohlcv(db, symbol, start_ms, end_ms)
+    adr = _load_capped_onchain(onchain_asset, end_ms)
 
     features = build_features(ohlcv, onchain=adr)
     expected_cols = list(FEATURE_COLUMNS) + list(ONCHAIN_FEATURE_COLUMNS)
@@ -133,9 +145,10 @@ def run(window: str) -> dict:
     def _d(ts_ms: int) -> str:
         return str(pd.Timestamp(int(ts_ms), unit="ms").date())
 
+    experiment = "6" if symbol == DEFAULT_SYMBOL else "7"
     print("\n" + "=" * 68)
-    print(f"EXPERIMENT 6 — {SYMBOL} {TIMEFRAME} + on-chain AdrActCnt "
-          f"[{window.upper()} WINDOW]")
+    print(f"EXPERIMENT {experiment} — {symbol} {TIMEFRAME} + on-chain "
+          f"AdrActCnt ({onchain_asset}) [{window.upper()} WINDOW]")
     print("=" * 68)
     print(f"Window (candle open) : {_d(ohlcv.index.min())} -> {_d(ohlcv.index.max())}"
           f"  ({len(ohlcv)} bars, cap < {_d(end_ms)})")
@@ -160,6 +173,8 @@ def run(window: str) -> dict:
 
     return {
         "window": window,
+        "symbol": symbol,
+        "onchain_asset": onchain_asset,
         "net_sharpe": m["sharpe"],
         "gross_sharpe": gross_sharpe,
         "net_return": m["total_return"],
@@ -180,8 +195,12 @@ def main() -> None:
     os.environ["MODE"] = "backtest"
     os.environ["SLIPPAGE_BPS"] = "2"
 
-    parser = argparse.ArgumentParser(description="Experiment 6 walk-forward run.")
+    parser = argparse.ArgumentParser(description="Experiment 6/7 walk-forward run.")
     parser.add_argument("--window", choices=list(_WINDOWS), default="tuning")
+    parser.add_argument("--symbol", default=DEFAULT_SYMBOL,
+                        help="Trading pair (BTC/USDT = Exp 6, ETH/USDT = Exp 7).")
+    parser.add_argument("--onchain-asset", default=DEFAULT_ONCHAIN_ASSET,
+                        help="CoinMetrics asset for AdrActCnt (btc or eth).")
     parser.add_argument(
         "--confirm-holdout", action="store_true",
         help="Required for --window holdout. Only after the explicit "
@@ -195,7 +214,7 @@ def main() -> None:
             "after the explicit 'RUN HOLDOUT' instruction."
         )
 
-    run(args.window)
+    run(args.window, symbol=args.symbol, onchain_asset=args.onchain_asset)
 
 
 if __name__ == "__main__":

@@ -480,3 +480,87 @@ definitions, N=1 Flat/Long labels at 24bps, XGBoost as specified, threshold
 dominated by a bull regime. Not a claim about on-chain data generally, other
 metrics (e.g. fees, transfer value, SOPR), other horizons, or regime-dependent
 deployment — none of those were tested.
+
+---
+---
+
+# ETH/USDT 1d + On-chain AdrActCnt — Pre-registered Negative (Seventh)
+
+**Date:** 2026-06-10
+**Asset / timeframe:** ETH/USDT, 1d, spot, long-only (Flat/Long, no short, no
+leverage). On-chain data: CoinMetrics Community API `AdrActCnt` for **eth**.
+**Hypothesis (pre-registered replication of the sixth experiment):** the
+on-chain activity signal that produced positive OOS economics on BTC replicates
+on a second asset. Identical features, costs, labels, walk-forward, threshold,
+windows, and acceptance criteria — only the asset pair changed.
+
+## Design notes
+
+- Fetcher parameterized by asset (`--asset eth`), per-asset parquet caches; the
+  BTC cache verified byte-identical (SHA256) before/after. The four leakage
+  proofs re-run against the REAL cached ETH AdrActCnt series (100-row rule
+  check, literal D-1 recompute, anti-vacuity, deliberate injection) — all
+  green alongside the unchanged BTC tests (suite: 109 passed).
+- Windows shared with the sixth experiment: tuning 2018-01-01 → 2023-01-01;
+  locked holdout 2023-01-01 → **2025-06-01 hard cap** (data extends to 2026-06;
+  the runner refuses to read past the cap). Nothing tuned on tuning results.
+
+## Tuning window (walk-forward OOS 2018-12-12 → 2022-12-30, 1,480 bars, net of 24bps)
+
+| Metric | Strategy (net) | Buy & Hold ETH |
+|---|---:|---:|
+| Net Sharpe | **+1.00** (gross +1.29) | **+1.16** |
+| Total return | +65.30% (gross +86.67%) | +1,242.12% |
+| Max drawdown | −16.09% | −79.30% |
+| Round trips | 296 (win rate 58.8%) | — |
+| Avg PnL/trade | **+$22.06** | — |
+| Turnover | 120.7× | — |
+
+The signal replicated on ETH in tuning, stronger than on BTC (net Sharpe 1.00
+vs 0.21; avg PnL +$22.06 vs +$2.32).
+
+## LOCKED HOLDOUT (single read, frozen config; walk-forward within
+## 2023-01-01 → 2025-06-01; OOS 2023-07-07 → 2025-05-26, 690 bars)
+
+| Metric | Strategy (net) | Buy & Hold ETH |
+|---|---:|---:|
+| Net Sharpe | **+0.25** (gross +0.68) | **+0.58** |
+| Total return | +3.54% (gross +11.09%) | +37.03% |
+| Max drawdown | −9.97% | −63.75% |
+| Round trips | 154 (win rate 55.8%) | — |
+| Avg PnL/trade | **+$2.30** | — |
+| Turnover | 61.8× | — |
+
+## Verdict — REJECT (criterion 2 failed)
+
+| # | Criterion | Result | Verdict |
+|---|---|---|---|
+| 1 | Holdout net Sharpe > 0.0 | +0.25 | PASS |
+| 2 | Holdout net Sharpe > B&H Sharpe (same period) | 0.25 vs **0.58** | **FAIL** |
+| 3 | Holdout avg PnL/trade > 0 | +$2.30 | PASS |
+| 4 | Holdout trade count ≥ 30 | 154 | PASS |
+
+Per the locked rule, one failure = **REJECT. No reruns, no adjustments.**
+
+**Key finding:** the replication PARTIALLY held. For the second asset in a row,
+the on-chain configuration posted positive out-of-sample economics on a locked
+holdout (net Sharpe +0.25, +$2.30/trade, 55.8% win rate) — criteria 1, 3, 4
+passed on both BTC and ETH. That consistency (positive net Sharpe, positive
+per-trade PnL, >50% win rate, 2 assets × 2 windows = 4 independent OOS reads)
+suggests AdrActCnt carries genuine, if modest, information. But the same
+structural failure repeated: a long-only, part-time-invested filter could not
+beat holding the asset on the risk-adjusted axis in windows where the asset
+itself rallied (ETH holdout B&H Sharpe 0.58 vs 0.25; tuning-vs-holdout decay
+1.00 → 0.25 also notable). Both experiments delivered far shallower drawdowns
+(−10% vs −64% here), but drawdown is not a registered criterion. Honest
+negative under the registered rule, both times.
+
+## Scope caveat
+
+Specific to: eth AdrActCnt alone, these three feature definitions, N=1
+Flat/Long labels at 24bps, XGBoost as specified, threshold 0.50, ETH/USDT 1d,
+long-only spot with the stated cost model, and the shared 2023-01 → 2025-06
+holdout. The repeated criterion-2 failure pattern (signal real but below the
+asset's own bull-window Sharpe) is an observation, not a tested hypothesis
+about regime-conditioned deployment — that would require a new pre-registered
+experiment.
