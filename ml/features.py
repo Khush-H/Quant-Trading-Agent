@@ -23,6 +23,22 @@ Feature set (all stationary, all trailing)
 
 The currently-forming candle is already dropped at ingest time, so every bar
 read from the DB is closed; using bar ``t`` in row ``t`` is therefore causal.
+
+On-chain features (Experiment 6, optional, 1d only)
+---------------------------------------------------
+When :func:`build_features` is given an ``onchain`` frame (CoinMetrics
+``[date, AdrActCnt]`` from :mod:`src.onchain.coinmetrics_fetcher`), exactly
+three more columns are APPENDED after the OHLCV set, computed by
+:mod:`src.onchain.features` under a hard D-1 point-in-time lag (a row for
+trading day D uses only AdrActCnt dated D-1 or earlier — proven by
+``tests/test_onchain_pit_leakage.py``):
+
+* ``adr_zscore_28d``        — 28-day rolling z-score of AdrActCnt, ending D-1.
+* ``adr_mom_7d``            — ``AdrActCnt[D-1] / AdrActCnt[D-8] - 1``.
+* ``adr_price_diverge_28d`` — ``adr_zscore_28d`` minus the 28-day trailing
+  z-score of close (pipeline convention).
+
+Without ``onchain`` the output is unchanged: exactly :data:`FEATURE_COLUMNS`.
 """
 
 from __future__ import annotations
@@ -35,6 +51,12 @@ import pandas as pd
 
 from config import Settings, get_settings
 from core.database import FEATURE_COLUMNS, Database
+from src.onchain.features import (
+    ADR_MOM_LAG,
+    ADR_Z_WINDOW,
+    ONCHAIN_FEATURE_COLUMNS,
+    add_onchain_features,
+)
 
 # Lookback windows. Kept as named constants because they are part of the
 # feature recipe that feature_hash pins.
@@ -80,27 +102,40 @@ def _garman_klass_vol(df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.sqrt(var), index=df.index)
 
 
-def compute_feature_hash() -> str:
+def compute_feature_hash(include_onchain: bool = False) -> str:
     """Stable hash of the feature RECIPE (not of any data).
 
     Combines the ordered feature names, the lookback parameters, and the
     feature-code version. Identical for every row of one build; changes only
     when the recipe changes. The model phase can store this alongside a trained
     artifact and refuse to predict on features built under a different recipe.
+
+    ``include_onchain=True`` extends the recipe with the three Experiment-6
+    on-chain columns and their parameters, so a model trained WITH them can
+    never be silently scored against features built WITHOUT them (or vice
+    versa). The default hash is unchanged from before the experiment.
     """
-    recipe = "|".join(
-        [
-            f"v{FEATURE_VERSION}",
-            "cols=" + ",".join(FEATURE_COLUMNS),
-            f"gk_ma={GK_VOL_MA_WINDOW}",
-            f"z={ZSCORE_WINDOW}",
-            f"ret_lag={LOG_RET_LONG_LAG}",
+    parts = [
+        f"v{FEATURE_VERSION}",
+        "cols=" + ",".join(FEATURE_COLUMNS),
+        f"gk_ma={GK_VOL_MA_WINDOW}",
+        f"z={ZSCORE_WINDOW}",
+        f"ret_lag={LOG_RET_LONG_LAG}",
+    ]
+    if include_onchain:
+        parts += [
+            "onchain=" + ",".join(ONCHAIN_FEATURE_COLUMNS),
+            f"adr_z={ADR_Z_WINDOW}",
+            f"adr_mom={ADR_MOM_LAG}",
+            "adr_lag=1",
         ]
-    )
+    recipe = "|".join(parts)
     return hashlib.sha256(recipe.encode("utf-8")).hexdigest()[:16]
 
 
-def build_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
+def build_features(
+    ohlcv: pd.DataFrame, onchain: Optional[pd.DataFrame] = None
+) -> pd.DataFrame:
     """Return the causal feature matrix for one symbol/timeframe.
 
     ``ohlcv`` must be indexed by ``ts`` (bar open time, ms) ascending, with
@@ -109,8 +144,15 @@ def build_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     :data:`FEATURE_COLUMNS`. Warmup rows (where any trailing window is short)
     are dropped via ``dropna`` so no row is computed on partial history.
 
+    ``onchain`` (1d candles only): the CoinMetrics ``[date, AdrActCnt]`` frame.
+    When given, the three Experiment-6 on-chain columns are appended AFTER
+    every existing feature, computed under the D-1 point-in-time lag by
+    :func:`src.onchain.features.add_onchain_features`. Existing columns are
+    not touched.
+
     Causality: every feature at row t depends only on close/volume/OHLC at t
-    and earlier. No ``shift(-k)`` / forward window appears here.
+    and earlier (and, for the on-chain columns, AdrActCnt dated t-1 or
+    earlier). No ``shift(-k)`` / forward window appears here.
     """
     if not ohlcv.index.is_monotonic_increasing:
         ohlcv = ohlcv.sort_index()
@@ -133,6 +175,10 @@ def build_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     feats["z_vol"] = _zscore(volume, ZSCORE_WINDOW)
 
     feats = feats[list(FEATURE_COLUMNS)]
+    if onchain is not None:
+        # Appended strictly AFTER all existing features; same index, so the
+        # shared dropna below also drops on-chain warmup rows.
+        feats = feats.join(add_onchain_features(ohlcv, onchain))
     return feats.dropna()
 
 

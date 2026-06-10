@@ -386,3 +386,97 @@ long-only spot, the stated cost model, and the 2024-10 → 2026-06 locked window
 Not a claim that vol-targeting is useless in general (it demonstrably shapes
 drawdown), nor about leveraged/multi-asset risk-parity sizing, other models, or
 other regimes — only that, here, it creates no edge a sized benchmark lacks.
+
+---
+---
+
+# BTC/USDT 1d + On-chain AdrActCnt — Pre-registered Negative (Sixth)
+
+**Date:** 2026-06-10
+**Asset / timeframe:** BTC/USDT, 1d, spot, long-only (Flat/Long, no short, no
+leverage). On-chain data: CoinMetrics Community API `AdrActCnt` (daily active
+addresses), information source only.
+**Hypothesis (fresh information test):** on-chain activity carries predictive
+information for BTC spot direction beyond OHLCV. Project reopened for this one
+pre-registered experiment after the five-experiment termination.
+
+## Pre-registered design (frozen before any results were seen)
+
+- **Tuning window:** 2018-01-01 → 2023-01-01. **Locked holdout:** 2023-01-01 →
+  **2025-06-01 (HARD CAP** — stored data extends to 2026-06 but the runner
+  refuses to read past the cap, enforced by assertion).
+- **Exactly three new features** appended after the unchanged 6 OHLCV features:
+  `adr_zscore_28d` (28d rolling z of AdrActCnt, window ending D-1),
+  `adr_mom_7d` (`AdrActCnt[D-1]/AdrActCnt[D-8] − 1`),
+  `adr_price_diverge_28d` (`adr_zscore_28d` minus 28d trailing close z-score).
+- **Point-in-time rule:** a feature row for trading day D uses only AdrActCnt
+  dated **D-1 or earlier** (CoinMetrics publishes day D at end of day D UTC).
+  Proven by `tests/test_onchain_pit_leakage.py`: perturbation invariance on a
+  100-row sample, literal D-1 recompute, anti-vacuity, and a deliberate
+  injected-leak check that the test catches. Full suite 105 passed.
+- Everything else unchanged: labels (N=1, 24bps hurdle), XGB params,
+  walk-forward (5 splits, embargo = label horizon), costs (10bps taker +
+  2bps slippage per side), threshold 0.50, 20% fixed-fractional, long-only.
+  Nothing was tuned on tuning results (no threshold/param search was run).
+- **Acceptance (ALL four required):** holdout net Sharpe > 0; holdout net
+  Sharpe > B&H Sharpe same period; avg PnL/trade > 0; trades ≥ 30. Any single
+  failure = REJECT, no reruns.
+
+## Tuning window (walk-forward OOS 2018-12-12 → 2022-12-30, 1,480 bars, net of 24bps)
+
+| Metric | Strategy (net) | Buy & Hold BTC |
+|---|---:|---:|
+| Net Sharpe | **+0.21** (gross +0.58) | **+0.91** |
+| Total return | +6.61% (gross +22.00%) | +382.07% |
+| Max drawdown | −16.27% | −76.63% |
+| Round trips | 285 (win rate 58.2%) | — |
+| Avg PnL/trade | **+$2.32** | — |
+| Turnover | 114.4× | — |
+
+First positive-economics tuning run in project history (positive net Sharpe,
+positive avg PnL/trade, >50% win rate) — noted, not acted on.
+
+## LOCKED HOLDOUT (single read, frozen config; walk-forward within
+## 2023-01-01 → 2025-06-01; OOS 2023-07-07 → 2025-05-26, 690 bars)
+
+| Metric | Strategy (net) | Buy & Hold BTC |
+|---|---:|---:|
+| Net Sharpe | **+1.07** (gross +1.61) | **+1.63** |
+| Total return | +15.10% (gross +22.80%) | +260.64% |
+| Max drawdown | −5.27% | −28.10% |
+| Round trips | 154 (win rate 53.9%) | — |
+| Avg PnL/trade | **+$9.81** | — |
+| Turnover | 61.5× | — |
+
+## Verdict — REJECT (criterion 2 failed)
+
+| # | Criterion | Result | Verdict |
+|---|---|---|---|
+| 1 | Holdout net Sharpe > 0.0 | +1.07 | PASS |
+| 2 | Holdout net Sharpe > B&H Sharpe (same period) | 1.07 vs **1.63** | **FAIL** |
+| 3 | Holdout avg PnL/trade > 0 | +$9.81 | PASS |
+| 4 | Holdout trade count ≥ 30 | 154 | PASS |
+
+Per the locked rule, one failure = **REJECT. No reruns, no adjustments.**
+
+**Key finding:** this is the strongest result the pipeline has ever produced —
+the first configuration with genuinely positive out-of-sample economics
+(net Sharpe +1.07, +$9.81/trade, costs NOT fatal: gross 1.61 → net 1.07).
+On-chain activity does appear to carry usable information. But the bar is
+beating the asset itself, and 2023-01 → 2025-06 was a strong BTC bull window:
+buy-and-hold posted Sharpe 1.63 / +261%. A long-only filter that is in the
+market only part-time could not keep up on the risk-adjusted axis, despite a
+5× shallower drawdown (−5.3% vs −28.1%). The drawdown advantage is real but —
+as in every prior experiment — partially mechanical (being in cash most bars).
+A "beat Sharpe OR beat return with ≤ half the drawdown" criterion would have
+read differently; that criterion was NOT pre-registered, so it does not count.
+Honest negative under the registered rule.
+
+## Scope caveat
+
+Specific to: AdrActCnt alone (no other on-chain metrics), these three feature
+definitions, N=1 Flat/Long labels at 24bps, XGBoost as specified, threshold
+0.50, BTC/USDT 1d, long-only spot with the stated cost model, and a holdout
+dominated by a bull regime. Not a claim about on-chain data generally, other
+metrics (e.g. fees, transfer value, SOPR), other horizons, or regime-dependent
+deployment — none of those were tested.

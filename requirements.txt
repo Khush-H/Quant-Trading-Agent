@@ -11,6 +11,7 @@ fastapi==0.115.14
 uvicorn==0.34.3
 pydantic==2.11.10
 pydantic-settings==2.8.1
+pyarrow==24.0.0
 
 # --- Dev / test ---
 pytest==9.0.3

@@ -20,13 +20,14 @@ dependencies = [
     "uvicorn==0.34.3",
     "pydantic==2.11.10",
     "pydantic-settings==2.8.1",
+    "pyarrow==24.0.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
 
 [tool.setuptools]
-packages = ["config", "core", "ml", "backtest", "web", "scripts"]
+packages = ["config", "core", "ml", "backtest", "web", "scripts", "src", "src.onchain"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
