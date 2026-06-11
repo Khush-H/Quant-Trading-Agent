@@ -640,3 +640,87 @@ stated cost model, and the 2019–2021 tuning window. NOT a holdout-validated
 negative (the holdout was deliberately preserved unread). Not a claim about
 the premium at other horizons (e.g. 1d aggregation), maker-fee execution,
 or as a filter on a lower-frequency strategy — none of those were tested.
+
+---
+---
+
+# LINK/USDT 1d + Coinbase Premium — REJECT at the Tuning Gate (Ninth)
+
+**Date:** 2026-06-11
+**Asset / timeframe:** LINK/USDT, 1d, spot, long-only (Flat/Long, no short, no
+leverage), executed on Binance. Signal source: the Coinbase−Binance price
+premium on LINK, ``(coinbase_close − binance_close) / binance_close × 100``,
+both closes from the same closed DAILY bar (T-inclusive, no lag needed).
+**Hypothesis:** the eighth experiment found the premium's gross edge on BTC 1h
+was destroyed by hourly-frequency costs; this experiment tests whether the
+premium carries directional information at the cost-survivable DAILY horizon,
+on a second asset (LINK).
+
+## Pre-registered design
+
+- **Tuning window:** 2020-10-01 → 2024-01-01. **Locked holdout:** 2024-01-01 →
+  2025-06-01 hard cap.
+- **Data:** dual-source fetch — Coinbase side via direct GETs to
+  ``api.exchange.coinbase.com/products/LINK-USD/candles`` (granularity 86400,
+  300-candle pages, forward ``start`` pagination); Binance LINK/USDT 1d via
+  ccxt — aligned on UTC date by strict intersection. **1,704 of 1,704 expected
+  days aligned; 0 dropped (0.000%, under the 1% stop-rule)**, never
+  forward-filled. Atomic parquet cache (`link_coinbase_premium.parquet`) +
+  alignment-audit sidecar; all prior caches verified byte-identical (SHA256).
+- **Exactly three features**, identical definitions to Experiment 8 at daily
+  resolution: `coinbase_premium` (raw, at the closed bar T),
+  `premium_zscore_168h` (168-DAY z ending at T, min_periods=168, std 0/NaN →
+  0), `premium_mom_24h` (`premium[T]/premium[T−24 days] − 1`, denom 0/NaN →
+  0). The feature builder now infers the bar interval (1h/1d) from the premium
+  frame and REFUSES mixed resolutions; hourly behavior proven byte-identical
+  by the unchanged Experiment 8 tests.
+- **PIT rule (T-inclusive):** row T uses only premium values dated T or
+  earlier. Proven by `tests/test_link_premium_pit_leakage.py`: perturbation
+  invariance on 100 sampled rows, literal recompute with day-based windows,
+  anti-vacuity on all three features, a deliberate T+1 injection caught, plus
+  the resolution-mismatch guard. Full suite 120 passed.
+- Everything else unchanged: labels (N=1, 24bps), XGB params, walk-forward
+  (5 splits, embargo = label horizon), costs (10bps taker + 2bps slippage per
+  side), threshold 0.50, 20% fixed-fractional, long-only. Nothing tuned on
+  tuning results.
+
+## Tuning window (walk-forward OOS 2021-05-27 → 2023-12-27, 945 bars, net of 24bps)
+
+| Metric | Strategy (net) | Buy & Hold LINK |
+|---|---:|---:|
+| Net Sharpe | **−0.33** (gross **−0.12**) | **+0.22** |
+| Total return | −12.92% (gross −5.89%) | −47.34% |
+| Max drawdown | −22.43% | −85.25% |
+| Round trips | 170 (win rate 50.6%) | — |
+| Avg PnL/trade | **−$7.60** | — |
+| Turnover | 68.1× | — |
+
+(Full tuning-window B&H Sharpe, entry at window start: +0.67, for reference.)
+
+## Verdict — REJECT at the tuning gate; HOLDOUT NOT RUN
+
+Decision (user, pre-holdout): **gross Sharpe is negative (−0.12) across 170
+out-of-sample trades** — the signal contains no directional information even
+before costs, so running the holdout is not scientifically justified.
+**The 2024-01-01 → 2025-06-01 holdout was never read and remains locked**
+(holdout-era LINK 1d candles were never even fetched into the DB; the ingest
+loop was capped strictly below 2024-01-01).
+
+**Key finding:** a different failure mode from Experiment 8, and the more
+terminal one. On BTC 1h the premium had real gross edge (+1.68) that costs
+destroyed; on LINK 1d there is **no gross edge at all** — the gross-to-net gap
+is small (−0.12 → −0.33, as expected at 68× daily turnover; costs are NOT the
+problem here), but the underlying signal is absent. The premise that US-venue
+price leadership transfers from BTC to LINK and survives daily aggregation is
+not supported: with a mean premium of +0.02% and std 0.09%, the LINK premium
+is mostly venue micro-noise at the daily close, not positioning information.
+
+## Scope caveat
+
+Specific to: these three premium feature definitions at daily resolution, N=1
+Flat/Long labels at 24bps, XGBoost as specified, threshold 0.50, LINK/USDT 1d
+on Binance with the stated cost model, and the 2020-10 → 2024-01 tuning
+window (largely LINK bear/chop: B&H −47% over the OOS span). NOT a
+holdout-validated negative (the holdout was deliberately preserved unread).
+Not a claim about the premium on BTC/ETH at 1d, maker-fee execution, or
+intraday premium dynamics aggregated differently — none of those were tested.
