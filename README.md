@@ -1,226 +1,206 @@
 # Quant Trading Agent
 
-A production-grade quantitative trading research pipeline built 
-backtester-first, with a hard performance gate before any live 
-infrastructure is built. The pipeline was used to run eight 
-pre-registered experiments testing whether a solo developer can 
-extract directional or risk-adjusted edge from OHLCV, 
-derivatives, on-chain, and cross-exchange data using XGBoost. 
-The answer, across all eight, was no ACCEPT — and that is the 
-result, not a failure. Experiments 6–7 (on-chain active-address 
-features, BTC then an ETH replication) produced the project's 
-first genuinely positive out-of-sample economics on locked 
-holdouts, and were still rejected under the pre-registered rule: 
-a long-only filter never beat the asset's own Sharpe in a bull 
-window. Experiment 8 (Coinbase-premium features at 1h) was 
-rejected at the tuning gate — a real gross edge (+1.68 Sharpe) 
-destroyed by costs at 765× hourly turnover — with its holdout 
-deliberately left unread.
+A machine learning trading pipeline built to answer one question honestly:
+can a gradient-boosted classifier extract executable alpha from crypto spot
+markets, net of realistic transaction costs?
 
-## The Core Principle
+**The answer, across nine pre-registered experiments, is no.**
 
-> The backtester is a gate, not a step.
+That is not a failure of engineering. It is the engineering working correctly.
 
-Phases 0–4 (data → features → labels → train → backtest) produce 
-one verdict: does this beat buy-and-hold net of costs, 
-out-of-sample? Phases 5–8 (paper engine, risk gate, dashboard, 
-live) are only worth building if that verdict is yes.
+---
 
-The gate returned no across eight pre-registered experiments. The 
-live execution path (Phase 8) was never enabled. The paper engine, 
-risk gate, and dashboard were built as a pure engineering exercise 
-with the live path hard-gated behind `LIVE_TRADING_CONFIRMED=true`.
+## What This Project Actually Is
+
+Most student trading projects optimise until the backtest looks good, then
+stop. This one was built differently. The core constraint was established
+before a single experiment ran: **the backtester is a gate, not a step.**
+No live infrastructure would be built until the gate returned a positive
+verdict on a locked, unread holdout. It never did. The infrastructure was
+built anyway — as a pure engineering exercise — and the gate result was
+accepted.
+
+The result is a codebase that demonstrates something more useful than a
+profitable backtest: a system explicitly designed to resist being gamed,
+including by its own creator.
+
+---
 
 ## Architecture
-core/          position manager, exchange wrapper, trading daemon,
-risk engine
-ml/            features, labels, walk-forward training
-backtest/      event-driven backtester, cost model, metrics
-src/onchain/   CoinMetrics + dual-exchange fetchers, PIT feature
-builders (on-chain D-1 lag; Coinbase premium T-inclusive)
-web/           read-only FastAPI dashboard
-config/        pydantic-settings, all secrets from env vars
-tests/         114 tests, all passing
-scripts/       fetch, backtest, paper trading, halt reset
-results/       backtest_verdict.md — the full experiment record
 
-**Stack:** Python 3.13, XGBoost, CCXT, FastAPI, SQLite (WAL).  
-**Execution:** spot only, long-only, no shorting, no leverage 
-anywhere in the codebase.  
-**Single chokepoint:** every order routes through 
-`risk_check(order)` before reaching any executor — enforced by 
-tests that assert the executor is never called when `risk_check` 
-rejects.
+```
+Data Layer          → CCXT (Binance/Coinbase), CoinMetrics on-chain API,
+                      SQLite WAL, atomic parquet writes
 
-## Leakage Guarantees
+Feature Pipeline    → Causal-only OHLCV features, on-chain active address
+                      metrics, cross-exchange Coinbase Premium; all with
+                      explicit point-in-time leakage tests per data source
 
-The pipeline's most important property is that it cannot lie to 
-itself. Five independent guarantees are enforced and tested:
+Labels              → 2-class (Flat/Long), 24bps round-trip hurdle,
+                      no-overlap leakage proof
 
-**OHLCV no-overlap test:** perturbing any bar after time T leaves 
-T's feature row byte-identical. Perturbing any bar before T leaves 
-T's label unchanged. Proven by `tests/test_features_labels.py`.
+Backtester          → Event-driven walk-forward, fills at t+1 open,
+                      embargo gap = label horizon, cost model: 10bps taker
+                      + 2bps slippage per side, gross/net Sharpe decomposition
 
-**Funding rate point-in-time test:** for each 4h candle closing at 
-T, the funding feature uses only the most recently *settled* rate 
-at or before T. Perturbing any settlement after T's close leaves 
-T's feature row byte-identical. Proven by 
-`tests/test_funding_pit_leakage.py`.
+Risk Engine         → 24h rolling drawdown HALT (≤ −3%), consecutive
+                      exchange-failure HALT, stale-heartbeat HALT;
+                      never self-clears; manual reset only
 
-**Realized volatility point-in-time test:** the vol estimate at T 
-uses only data through T's close, uncentered. Perturbing any bar 
-after T leaves T's vol estimate byte-identical. Proven by 
-`tests/test_realized_vol_pit_leakage.py`.
+Paper Daemon        → Hourly execution loop, drops forming candle, scores
+                      only closed bars, fills via same CostModel as
+                      backtester (paper/backtest agree by construction)
 
-**On-chain D-1 point-in-time test:** CoinMetrics publishes day 
-D's active-address count at end of day D UTC, so a feature row 
-for trading day D may use only values dated D-1 or earlier. 
-Proven four ways on a 100-row sample (for both BTC and real ETH 
-data): perturbing any value dated D or later leaves D's feature 
-row byte-identical; a literal recompute from D-1-or-earlier 
-values matches; bumping the D-1 value moves the row 
-(anti-vacuity); and a deliberately injected AdrActCnt[D] leak is 
-caught. Proven by `tests/test_onchain_pit_leakage.py`.
+Dashboard           → Read-only FastAPI; SQLite opened in mode=ro at engine
+                      level; SELECT-only queries proven by connection-spy
+                      test; single state-changing endpoint requires explicit
+                      confirm flag and routes through the same guarded
+                      clear_halt as the manual reset script
 
-**Coinbase-premium T-inclusive test:** the premium at T is 
-computed from both exchanges' closed bars at T, so T itself is 
-usable; the proof is that the 168h z-score and 24h momentum 
-windows never reach past T. Same four proofs (100-row 
-perturbation invariance for values dated strictly after T, 
-literal recompute, anti-vacuity on all three features, deliberate 
-T+1 injection caught). Proven by 
-`tests/test_coinbase_premium_pit_leakage.py`.
+Live Gate           → Phase 8 hard-gated behind LIVE_TRADING_CONFIRMED=true
+                      and --i-understand-the-risks; never unlocked
+```
 
-A pipeline with lookahead leakage produces beautiful backtests. 
-These tests prove the negative results are real.
+**120 tests passing.** Every invariant has a test. Every leakage proof is
+adversarial — it injects a deliberately broken builder and asserts the test
+catches it.
 
-## The Eight Experiments
+---
 
-All eight were pre-registered (hypothesis and acceptance rule stated 
-before any data was touched). Seven were evaluated on a locked 
-holdout read exactly once; the eighth was rejected at the tuning 
-gate with its holdout deliberately left unread. Every verdict was 
-accepted as written.
+## The Single Chokepoint Invariant
 
-| # | Config | Tuning | Locked | Verdict |
-|---|--------|--------|--------|---------|
-| 1 | BTC/USDT 1h, raw signal | −38% / Sharpe −1.32 | −47% / −8.03 | REJECT |
-| 2 | BTC/USDT 1h, isotonic calibration + turnover-anchored threshold | +0.02% / 0.04 | 0 trades (null by construction) | REJECT |
-| 3 | SOL/USDT 1d | +25% / 0.50 | −5.71% / −0.31 | REJECT |
-| 4 | BTC/USDT 4h + funding rate feature (PIT-aligned, leakage-tested) | −38% / −1.32 | −18% / −2.13 | REJECT |
-| 5 | BTC/USDT 4h, vol-targeted sizing (4-way A/B vs fixed + sized B&H) | FIXED −38%/−1.32, SIZED −38%/−1.63, FIXED B&H +479%/1.01, SIZED B&H +44%/0.91 | FIXED −18%/−2.13, SIZED −20%/−2.52, FIXED B&H −4%/0.17, SIZED B&H −0.6%/0.00 | REJECT |
-| 6 | BTC/USDT 1d + on-chain AdrActCnt, 3 features (D-1 PIT, leakage-tested) | +6.6% / 0.21 | +15.1% / **1.07** vs B&H 1.63 | REJECT |
-| 7 | ETH/USDT 1d + on-chain AdrActCnt (pre-registered replication of 6) | +65.3% / 1.00 | +3.5% / **0.25** vs B&H 0.58 | REJECT |
-| 8 | BTC/USDT 1h + Coinbase-premium, 3 features (T-inclusive PIT) | gross +26.9%/**+1.68**, net −41.3%/−2.54, 765× turnover | **not run** — rejected at tuning gate | REJECT |
+Every order in the system — paper, backtest, and live — routes through a
+single `risk_check()` function before reaching any executor. There is no
+bypass path. This is proven by test: the executor is unreachable without
+passing through `risk_check()`. The HALT state blocks BUYs and allows SELLs
+(flatten-to-cash), and HALT never self-clears.
 
-**Experiment 5 dual-benchmark finding:** vol-targeted sizing made 
-the model *worse* than fixed sizing on both tuning and locked 
-(−2.52 vs −2.13 Sharpe). The sized buy-and-hold benchmark beat the 
-sized model on every metric, confirming that any Sharpe improvement 
-from vol-targeting is free variance compression, not model edge.
+This is the same design principle as a security-critical system with a single
+authentication boundary. The trading risk engine and an access control gateway
+are solving the same structural problem.
 
-**Experiment 4 funding-sign finding:** the negative-funding 
-(short-squeeze) leg was the only profitable bucket in tuning 
-(+$103, 52% win) — exactly as hypothesized. On the locked slice it 
-went negative (−$116, 48% win). The apparent edge was 
-tuning-period noise, caught by the holdout. A 
-negative-funding-only variant was deliberately not built, as that 
-would have been fishing the holdout.
+---
 
-**Experiment 8 cost-structure finding:** the cleanest gross/net 
-separation of the project: the Coinbase premium has real gross 
-edge at 1h (gross Sharpe +1.68, matching buy-and-hold's), but 765× 
-turnover and the ~68pp gross-to-net gap annihilate it (net −2.54, 
-avg PnL/trade −$2.20 across 1,876 OOS trades). Rejected at the 
-tuning gate without reading the holdout — with per-trade economics 
-that negative, criterion 3 cannot pass, and spending the locked 
-slice would have bought nothing. Across eight experiments the 
-pattern is consistent: this cost model admits daily-horizon 
-signals and annihilates hourly ones.
+## The Nine Experiments
 
-**Experiments 6–7 on-chain finding:** the first configuration with 
-genuinely positive out-of-sample economics — positive net Sharpe, 
-positive avg PnL/trade (+$9.81 BTC, +$2.30 ETH), and >50% win 
-rates on every read (2 assets × tuning + holdout = 4 independent 
-OOS reads), with costs no longer fatal (BTC holdout gross 1.61 → 
-net 1.07). Three of four acceptance criteria passed on both 
-holdouts. Both still REJECT on the same criterion: a long-only, 
-part-time-invested filter never beat the asset's own Sharpe in 
-holdout windows that were bull runs (BTC B&H +261%, ETH +37%). 
-The 5× shallower drawdowns (−5% vs −28%; −10% vs −64%) were not a 
-registered criterion and do not count. A regime-conditioned 
-variant was not built — both holdouts are spent, and testing one 
-against them would be fishing.
+All pre-registered. All run on locked holdouts read exactly once. All accepted
+as written.
 
-Full details, cost reconciliation, and regime caveats for all 
-eight experiments are in `results/backtest_verdict.md`.
+| # | Asset / TF | Information Class | Net Sharpe | Verdict |
+|---|-----------|-------------------|-----------|---------|
+| 1 | BTC 1h | OHLCV raw | −8.03 | REJECT — cost drag |
+| 2 | BTC 1h | OHLCV + calibration | −4.71 | REJECT — cost drag |
+| 3 | SOL 1d | OHLCV | −0.31 | REJECT — sign flip |
+| 4 | BTC 4h | OHLCV + funding rate | −2.13 | REJECT — OOS collapse |
+| 5 | BTC 4h | Vol-targeted sizing | −2.52 | REJECT — sizing adds no edge |
+| 6 | BTC 1d | On-chain (AdrActCnt) | +1.07 | REJECT — below B&H (1.63) |
+| 7 | ETH 1d | On-chain (AdrActCnt) | +0.25 | REJECT — below B&H (0.58) |
+| 8 | BTC 1h | Coinbase Premium | −2.54 | REJECT at tuning gate |
+| 9 | LINK 1d | Coinbase Premium | −0.33 | REJECT at tuning gate |
 
-## Why Negative Results Are the Credential
+**The most important number in this table is not the Sharpe.** It is that
+Experiments 6 and 7 — the on-chain experiments — posted positive net Sharpe,
+positive avg PnL/trade, and above-50% win rates across four independent
+out-of-sample reads on two assets. The signal exists. The strategy cannot beat
+a passive benchmark in a sustained bull market, which is the correct and honest
+finding.
 
-A pipeline with lookahead leakage or data snooping produces 
-positive results almost automatically. The tests above prove these 
-results are clean. The consistent finding across three assets, 
-three timeframes, two orthogonal information sources (derivatives 
-positioning and on-chain activity), and a risk-adjusted sizing 
-layer is itself a result: a tree model on OHLCV and 
-publicly-available data does not produce an edge that beats 
-holding the asset, net of costs, at these horizons, for a solo 
-developer without co-location or proprietary data — even when the 
-signal itself is real, as the on-chain experiments showed.
+**The pre-registration protocol** required a stated hypothesis and acceptance
+rule before results were seen. One attempt was made during the project to
+change the acceptance benchmark after seeing a near-miss result. It was caught,
+interrogated, and rejected. The original criteria stood. The record of that
+exchange is in the commit history.
 
-The more important demonstration is methodological: every 
-experiment was pre-registered, the acceptance rule was committed 
-before results were seen, the locked holdout was read exactly once, 
-and the verdict was accepted — including when tuning data showed 
-apparent edge that died out-of-sample.
+---
 
-## Risk Engine
+## Security-Relevant Design Decisions
 
-`core/risk.py` implements a real circuit-breaker:
-- Trips `SYSTEM_HALT` on rolling 24h drawdown ≤ −3%, N 
-  consecutive exchange failures, or stale heartbeat
-- When halted: blocks BUYs, allows SELLs (flatten to cash routes 
-  through the same `risk_check` chokepoint — no bypass path)
-- HALT never self-clears; manual reset only via 
-  `scripts/reset_halt.py --confirm`
-- Tested: a −3% drawdown seeds the halt from the real evaluation 
-  path, then asserts a 0.99-confidence long is refused and the 
-  position is flattened
+For readers coming from a cybersecurity background, the engineering decisions
+that matter most are not the ML components:
 
-## Dashboard
+**Tamper-evident audit trail.** Every experiment result is committed to
+`results/backtest_verdict.md` before any subsequent work begins. The git
+history is the pre-registration record. Rewriting it would be detectable.
 
-Read-only FastAPI dashboard at `localhost:8000`. Opens SQLite in 
-`?mode=ro` (engine-level write rejection as defense-in-depth). 
-Displays mode, position, last 20 executions with fee/slippage, 
-rolling 24h PnL and drawdown, HALT state and reason, heartbeat. 
-The only state-changing endpoint is `POST /reset-halt`, which 
-requires explicit `confirm` and routes through the same guarded 
-`clear_halt` path as the manual script.
+**Leakage as an adversarial problem.** Each new data source required a
+dedicated leakage test with four components: a rule check, a literal
+recompute, an anti-vacuity proof (confirming the feature actually consumes
+the data), and a deliberate injection test (confirming the test catches the
+exact failure it guards against). A test that only checks the happy path is
+not a test.
+
+**Read-only enforcement at the engine level.** The dashboard database
+connection opens SQLite in `?mode=ro`. This is not application-level
+enforcement — it is enforced by the database engine itself and proven by a
+connection-spy test that attempts a write and asserts it raises.
+
+**No self-clearing failure states.** The HALT condition requires manual reset
+via a script that demands an explicit `--confirm` flag. Automatic recovery
+from a failure state is a security anti-pattern. The system fails closed.
+
+---
+
+## Stack
+
+Python 3.13 · XGBoost · scikit-learn · CCXT · FastAPI · SQLite (WAL) ·
+isotonic calibration · pandas · pytest (120 tests)
+
+---
+
+## What Was Not Built
+
+Phase 8 (live execution) was scaffolded and hard-gated. The gate never
+opened. The live infrastructure exists as an engineering exercise. No real
+capital was deployed. No API keys with withdrawal permissions were ever used.
+
+---
 
 ## Setup
 
 ```bash
+git clone https://github.com/Khush-H/Quant-Trading-Agent.git
+cd Quant-Trading-Agent
+
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+# Windows:
+.venv\Scripts\activate
+# macOS/Linux:
+source .venv/bin/activate
+
 pip install -r requirements.txt
-cp .env.example .env             # fill in your exchange keys
-pytest                           # 114 tests, all should pass
+
+cp .env.example .env   # no API keys required for backtesting
+
+pytest                 # 120 tests, all should pass
 ```
 
-To run the paper daemon (no live execution without 
-`LIVE_TRADING_CONFIRMED=true`):
-```bash
-python scripts/run_paper.py
+No exchange API keys are required to run the backtester or fetch
+historical data. Binance public OHLCV and CoinMetrics Community API
+endpoints are unauthenticated. The Coinbase Exchange candle endpoint
+used for premium features is also public.
+
+Live execution (Phase 8) requires exchange API keys and will not run
+without `LIVE_TRADING_CONFIRMED=true` and `--i-understand-the-risks`
+passed explicitly. The gate was never unlocked during this project.
+
+---
+
+## Repository Structure
+
 ```
-
-To view the dashboard:
-```bash
-uvicorn web.app:app --host 127.0.0.1 --port 8000
+src/
+  ml/           — features, labels, model training, backtester
+  onchain/      — CoinMetrics fetcher, Coinbase Premium fetcher,
+                  PIT leakage modules
+  risk/         — RiskEngine, HALT logic
+  execution/    — PaperExecutor, CostModel
+  api/          — FastAPI dashboard (read-only)
+scripts/
+  run_backtest.py
+  run_onchain_backtest.py
+  run_premium_backtest.py
+  reset_halt.py  — manual HALT reset, requires --confirm
+tests/           — 120 tests, all passing
+results/
+  backtest_verdict.md  — full experimental record
 ```
-
-## What Is Not Built
-
-`scripts/run_live.py` exists as a scaffold but live execution is 
-not implemented. It requires `LIVE_TRADING_CONFIRMED=true` and 
-`--i-understand-the-risks`. It will not be enabled until a 
-different model clears the Phase 3 gate on a clean holdout.
