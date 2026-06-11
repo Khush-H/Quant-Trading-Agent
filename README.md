@@ -188,19 +188,37 @@ passed explicitly. The gate was never unlocked during this project.
 ## Repository Structure
 
 ```
+config/
+  settings.py   — pydantic settings; MODE constraint + live-gate validation
+core/
+  engine.py     — the single order gateway; every order passes risk_check()
+  risk.py       — RiskEngine: drawdown/failure/heartbeat HALTs, never self-clears
+  exchange.py   — ccxt connectivity and the per-mode order executors
+  position.py   — position tracking, realized/unrealized PnL
+  database.py   — SQLite (WAL) persistence: candles, features, state
+ml/
+  features.py   — causal OHLCV features (+ on-chain/premium columns appended)
+  labels.py     — Flat/Long labels, 24bps round-trip hurdle
+  train.py      — walk-forward XGBoost, strict OOS evaluation
+  models/       — trained model artifacts (gitignored)
+backtest/
+  engine.py     — event-driven spot backtester, fills at t+1 open
+  costs.py      — CostModel: 10bps taker + 2bps slippage per side
+  metrics.py    — Sharpe, drawdown, turnover, benchmark comparison
 src/
-  ml/           — features, labels, model training, backtester
-  onchain/      — CoinMetrics fetcher, Coinbase Premium fetcher,
-                  PIT leakage modules
-  risk/         — RiskEngine, HALT logic
-  execution/    — PaperExecutor, CostModel
-  api/          — FastAPI dashboard (read-only)
+  onchain/      — CoinMetrics AdrActCnt fetcher, Coinbase Premium fetcher
+                  (BTC 1h / LINK 1d), PIT feature modules
+web/            — read-only FastAPI dashboard (app, queries, templates)
 scripts/
+  fetch_data.py — OHLCV ingest (drops the forming candle)
   run_backtest.py
-  run_onchain_backtest.py
-  run_premium_backtest.py
-  reset_halt.py  — manual HALT reset, requires --confirm
-tests/           — 120 tests, all passing
+  run_onchain_backtest.py        — Experiments 6–7
+  run_premium_backtest.py        — Experiment 8
+  run_link_premium_backtest.py   — Experiment 9
+  run_paper.py / run_live.py     — paper loop / hard-gated live entry
+  reset_halt.py — manual HALT reset, requires --confirm
+tests/          — 120 tests, all passing
 results/
   backtest_verdict.md  — full experimental record
+data/           — runtime artifacts: SQLite DB, parquet caches (gitignored)
 ```
